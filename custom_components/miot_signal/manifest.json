@@ -1,10 +1,12 @@
 {
   "domain": "miot_signal",
   "name": "MIoT Signal",
-  "version": "0.2.0",
-  "documentation": "https://example.invalid/miot_signal",
-  "issue_tracker": "https://example.invalid/miot_signal",
-  "codeowners": [],
+  "version": "0.1.0",
+  "documentation": "https://github.com/HAnshu47/xiaomi-voice-pet-control",
+  "issue_tracker": "https://github.com/HAnshu47/xiaomi-voice-pet-control/issues",
+  "codeowners": [
+    "@HAnshu47"
+  ],
   "requirements": [],
   "dependencies": [
     "xiaomi_home"
