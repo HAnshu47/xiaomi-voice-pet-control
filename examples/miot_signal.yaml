@@ -1,0 +1,57 @@
+# ============================================================
+# 语音信号绑定：小爱侧改某个开关 → 这里读到变化 → 执行脚本
+# 改完在 HA 里调用服务  miot_signal.reload  立即生效，不用重启
+# ============================================================
+#
+# 字段说明
+#   name            信号名，随便起，只用于日志和事件
+#   did             设备 DID（小米云设备 ID，不是实体 ID）
+#   siid / piid     MIoT 服务号 / 属性号，用 miot_signal.read 探测
+#   trigger         属性变成这个值时执行动作；写 any 表示只要变了就触发
+#   script          要执行的脚本名，对应 scripts.yaml 里的 key
+#   delay           执行脚本后等几秒再把开关恢复
+#   restore_entity  要恢复的实体（保证下次还能再触发）
+#   restore_value   恢复成什么；写 old 表示恢复成变化前的值
+#
+# 下面三条只是模板，DID 和实体 ID 都要换成你自己的。
+
+interval: 2
+
+signals:
+  # ① 清理猫砂盆 —— 摄像头「休眠」
+  #    米家场景：清理猫砂盆 → 摄像头 → 休眠
+  - name: clean
+    did: "1111111111"            # ← 换成你的摄像头 DID
+    siid: 2
+    piid: 1                      # 2:1 摄像头开关，false = 休眠
+    trigger: false
+    script: cat_litter_clean
+    delay: 2
+    restore_entity: switch.your_camera_on_p_2_1
+    restore_value: "on"
+
+  # ② 添加猫粮 —— 摄像头「关闭移动侦测」
+  #    米家场景：添加猫粮 → 摄像头 → 关闭移动侦测
+  - name: feed
+    did: "1111111111"
+    siid: 5
+    piid: 1                      # 5:1 移动侦测，false = 关闭
+    trigger: false
+    script: cat_feed
+    delay: 2
+    restore_entity: switch.your_camera_motion_detection_p_5_1
+    restore_value: "on"
+
+  # ③ 洗猫砂盆 —— 独立的插座（不接任何负载）
+  #    米家场景：洗猫砂盆 → 插座 → 开/关
+  #    用 trigger: any + restore_value: old，开和关两个方向都能触发，
+  #    触发后自动恢复原状。
+  - name: wash
+    did: "2222222222"            # ← 换成插座 DID
+    siid: 2
+    piid: 1
+    trigger: any
+    script: cat_wash
+    delay: 3
+    restore_entity: switch.your_socket
+    restore_value: old

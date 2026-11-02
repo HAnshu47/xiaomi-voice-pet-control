@@ -12,10 +12,10 @@ deps/
 blueprints/
 
 # 真实配置（含自己的设备 DID、账号信息）
-# 只提交 examples/ 里的脱敏模板
-miot_signal.yaml
-secrets.yaml
-automations.yaml
+# 只提交 examples/ 里的脱敏模板，所以这里的规则必须锚定到仓库根目录
+/miot_signal.yaml
+/secrets.yaml
+/automations.yaml
 
 # 备份与临时文件
 *.bak
