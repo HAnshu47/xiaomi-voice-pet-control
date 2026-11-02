@@ -1,0 +1,50 @@
+# ============================================================
+# Home Assistant 精简配置（Windows 原生运行）
+#
+# 不使用 default_config：它会强制加载 bluetooth / dhcp / ssdp / usb /
+# assist_pipeline，这些在 Windows 上需要 C 编译器或系统 DLL，容易启动失败。
+# 下面把真正需要的集成一条条列出来，功能差不多，但启动干净得多。
+# ============================================================
+
+frontend:
+  themes: !include_dir_merge_named themes
+
+config: {}
+person: {}
+homeassistant: {}
+
+automation: !include automations.yaml
+script: !include scripts.yaml
+scene: !include scenes.yaml
+
+# 本项目的核心：读取小米设备原始属性，当作语音信号
+miot_signal:
+
+input_boolean:
+  miot_auto_reset:
+    name: 设备自动复位中
+    icon: mdi:sync
+    initial: off
+
+logger:
+  default: warning
+  logs:
+    custom_components.miot_signal: debug
+    custom_components.xiaomi_home: debug
+
+system_log: {}
+persistent_notification: {}
+history: {}
+logbook: {}
+recorder: {}
+sun: {}
+my: {}
+network: {}
+webhook: {}
+media_source: {}
+tag: {}
+system_health: {}
+hardware: {}
+update: {}
+homeassistant_alerts: {}
+backup: {}

@@ -1,0 +1,49 @@
+# ============================================================
+# 被语音触发的动作脚本
+#
+# 脚本里的 entity_id 取决于你的设备在 HA 里叫什么，
+# 不一定和我的一样。用「开发者工具 → 状态」搜索确认后再替换。
+# ============================================================
+
+# 清理猫砂盆：PetKit 猫砂盆的「开始/恢复清洁」
+cat_litter_clean:
+  alias: 猫砂盆清扫
+  icon: mdi:shovel
+  mode: single
+  sequence:
+    - action: button.press
+      target:
+        entity_id: button.quan_zi_dong_mao_ce_suo_max_start_resume_cleaning
+
+# 添加猫粮：先选份量，再出粮
+# 可选档位是 5g 步进：1/20th Cup (5g) … 1/2 Cup (50g)
+cat_feed:
+  alias: 喂猫加餐
+  icon: mdi:bowl-mix
+  mode: single
+  sequence:
+    - action: select.select_option
+      target:
+        entity_id: select.manual_feed
+      data:
+        option: "1/10th Cup (10g)"
+
+# 洗猫砂盆：把猫砂全部倒进垃圾箱
+cat_litter_dump:
+  alias: 倒掉猫砂
+  icon: mdi:delete-empty
+  mode: single
+  sequence:
+    - action: button.press
+      target:
+        entity_id: button.quan_zi_dong_mao_ce_suo_max_dump_litter
+
+# 洗猫砂盆（备选）：让设备进入维护模式，停机方便拆洗
+cat_maintenance:
+  alias: 猫砂盆维护模式
+  icon: mdi:wrench
+  mode: single
+  sequence:
+    - action: button.press
+      target:
+        entity_id: button.quan_zi_dong_mao_ce_suo_max_start_maintenance_mode

@@ -1,0 +1,13 @@
+{
+  "domain": "miot_signal",
+  "name": "MIoT Signal",
+  "version": "0.2.0",
+  "documentation": "https://example.invalid/miot_signal",
+  "issue_tracker": "https://example.invalid/miot_signal",
+  "codeowners": [],
+  "requirements": [],
+  "dependencies": [
+    "xiaomi_home"
+  ],
+  "iot_class": "cloud_polling"
+}

@@ -1,0 +1,55 @@
+read:
+  name: 读取设备属性
+  description: 主动向小米云拉取某个设备的原始属性值，结果写入日志并返回。
+  fields:
+    did:
+      name: 设备 DID
+      description: 设备 ID，例如 1111111111（小米云设备 ID，不是实体 ID）
+      required: true
+      example: "1111111111"
+      selector:
+        text:
+    siid:
+      name: 服务 ID (siid)
+      required: true
+      example: 4
+      selector:
+        number:
+          min: 0
+          max: 64
+          mode: box
+    piid:
+      name: 属性 ID (piid)
+      required: true
+      example: 1
+      selector:
+        number:
+          min: 0
+          max: 64
+          mode: box
+
+watch:
+  name: 启动属性轮询
+  description: 后台定时读取一组属性，值变化时在事件总线触发 miot_signal 事件。
+  fields:
+    interval:
+      name: 轮询间隔（秒）
+      default: 2
+      selector:
+        number:
+          min: 1
+          max: 30
+          step: 0.5
+          mode: box
+    items:
+      name: 观察列表
+      description: 每项为 [did, siid, piid, 名称]
+      selector:
+        object:
+
+reload:
+  name: 重新加载绑定
+  description: 重新读取 miot_signal.yaml 里的信号绑定，不需要重启 Home Assistant。
+
+stop:
+  name: 停止属性轮询
