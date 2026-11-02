@@ -17,20 +17,27 @@ aiohttp 在 Windows 上默认优先用 `aiodns`（依赖 `pycares` 的 C 扩展�
 
 强制 aiohttp 只用线程池解析器 `ThreadedResolver`，不走 aiodns。
 
-编辑 `site-packages/aiohttp/resolver.py` 末尾：
+**推荐做法：在文件末尾追加一行赋值**，不要去找原来那一行改：
 
 ```python
-# 原始内容
-DefaultResolver: _DefaultType = DefaultResolver  # 或自动探测那一段
-
-# 改成
-DefaultResolver: _DefaultType = ThreadedResolver
+import io, os, aiohttp
+p = os.path.join(os.path.dirname(aiohttp.__file__), "resolver.py")
+s = io.open(p, encoding="utf-8").read()
+marker = "# [miot-signal] force threaded resolver"
+if marker not in s:
+    s += f"\n\n{marker}\nDefaultResolver = ThreadedResolver\n"
+    io.open(p, "w", encoding="utf-8").write(s)
 ```
 
-具体位置在文件末尾，找到给 `DefaultResolver` 赋值的那几行，直接替换成：
+原理：Python 模块加载时，后赋值的覆盖先赋值的。原文件里的
+`DefaultResolver` 可能写在 `if/else` 分支里，按行替换容易匹配不到却静默成功；
+追加到最后一行，任何 aiohttp 版本都成立。
 
-```python
-DefaultResolver: _DefaultType = ThreadedResolver
+验证：
+
+```bash
+python -c "import aiohttp.resolver as r; print(r.DefaultResolver)"
+# 应输出 <class 'aiohttp.resolver.ThreadedResolver'>
 ```
 
 ## 注意
