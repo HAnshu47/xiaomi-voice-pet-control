@@ -1,0 +1,34 @@
+{
+  "commands": [
+    {
+      "keywords": [
+        "打扫猫砂盆",
+        "清理猫砂盆",
+        "铲屎"
+      ],
+      "script": "cat_litter_clean"
+    },
+    {
+      "keywords": [
+        "喂猫",
+        "加餐",
+        "添加猫粮",
+        "猫粮"
+      ],
+      "script": "cat_feed"
+    },
+    {
+      "keywords": [
+        "洗猫砂盆",
+        "倒猫砂"
+      ],
+      "script": "cat_wash"
+    },
+    {
+      "keywords": [
+        "倒掉猫砂"
+      ],
+      "script": "cat_litter_dump"
+    }
+  ]
+}
