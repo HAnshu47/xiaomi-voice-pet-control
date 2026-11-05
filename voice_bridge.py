@@ -232,15 +232,16 @@ def ha_get_states() -> list:
         out.append(item)
 
     # 设备/品牌归属：REST states 不带设备信息，用 /api/template 一次拿全
-    # （device_id() -> 设备名、platform -> 所属集成，即"品牌"）
+    # （device_id() -> 设备名、platform -> 所属集成，即"品牌"）。
+    # 注意：Jinja 循环内 set 不出作用域，必须用 namespace 带出循环
     tpl = (
-        "{% set out = {} %}"
+        "{% set ns = namespace(out={}) %}"
         "{% for s in states %}{% set did = device_id(s.entity_id) %}"
         "{% if did %}{% set dev = device_attr(did, 'name_by_user') or "
         "device_attr(did, 'name') or did %}"
-        "{% set out = dict(out, **{s.entity_id: {'d': dev, 'b': "
+        "{% set ns.out = dict(ns.out, **{s.entity_id: {'d': dev, 'b': "
         "device_attr(did, 'platform') or device_attr(did, 'manufacturer') or ''}}) %}"
-        "{% endif %}{% endfor %}{{ out | to_json }}"
+        "{% endif %}{% endfor %}{{ ns.out | to_json }}"
     )
     dmap = {}
     try:
