@@ -82,6 +82,27 @@ PetKit 集成 → 小佩设备执行
 面板直接把口令映射到设备服务（如 `button/press`），**不需要先在 HA 写脚本**；
 传统 `script` 映射依然支持。
 
+### 集成中心：面板内装驱动 + 登录品牌
+
+面板第 6 个标签页，不用打开 HA 网页就能接入一个新品牌：
+
+1. **搜索**：输入品牌/设备名（如 `petkit`、`govee`、`tuya`），后端搜 GitHub 上的
+   Home Assistant 集成，按「仓库名命中 > 描述命中 > star」排序；也支持直接粘贴
+   `owner/repo` 或 GitHub 链接安装
+2. **安装**：自动下载 zip（GitHub 直连失败时切镜像）→ 解压时扫描
+   `custom_components/<domain>/manifest.json` 并读取真实 domain 落盘 →
+   调 HA API 重启 → 每 5 秒探测直到恢复
+3. **配置 / 登录**：代理 HA 的 config flow，动态渲染表单（文本/密码/数字/开关/下拉），
+   逐步骤提交；账密型集成全程不离开面板，OAuth 型会提示跳转授权一次
+4. **卸载**：删除该集成下的 config entries → 删除 `custom_components/<domain>` →
+   重启 HA。HA 内置集成、非法域名会被拒绝
+
+面板还会探测 HA 是否在运行：没运行会在集成中心顶部显示提示卡，
+点「启动 Home Assistant」即可后台拉起 `hass.exe`（独立进程，面板退出不影响）。
+
+> 安装来源限制在 GitHub 公开仓库的 HA 集成，**不执行任意脚本**；
+> 但仍建议优先选 star 多、更新活跃的仓库，第三方集成代码质量需自行判断。
+
 ### 方式二：直接改 JSON
 
 `voice_bridge.json`（与脚本同目录，首次运行自动生成）：
