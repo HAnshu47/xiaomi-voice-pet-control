@@ -150,6 +150,7 @@ _ring = _RingHandler()
 # HA 调用（自签 access token，每 20 分钟自动续）
 # ---------------------------------------------------------------------------
 _ha_token = {"value": "", "exp": 0.0}
+_ha_warn_at = 0.0        # 上次「HA 拉取失败」告警时间，用于降噪
 
 
 def _ha_make_token() -> str:
@@ -245,6 +246,7 @@ def _ha_integration_map() -> dict:
 
 def ha_get_states() -> list:
     """拉取 HA 实体列表（面板用），只保留可直接操作的域。"""
+    global _ha_warn_at
     from urllib import error as urlerror, request as urlrequest
 
     req = urlrequest.Request(
@@ -255,7 +257,10 @@ def ha_get_states() -> list:
         with urlrequest.urlopen(req, timeout=15) as r:
             states = json.loads(r.read().decode("utf-8", "replace"))
     except Exception as e:  # noqa: BLE001
-        log.warning("拉取 HA 实体失败: %s", e)
+        # HA 没启动时会被反复调用，60 秒内只提醒一次，避免刷屏
+        if time.time() - _ha_warn_at > 60:
+            _ha_warn_at = time.time()
+            log.warning("拉取 HA 实体失败(HA 未运行？): %s", e)
         return []
     keep = {"button", "select", "switch", "vacuum", "script", "fan", "light"}
     out = []
@@ -712,23 +717,17 @@ HA_CONFIG_DIR = BASE_DIR / "homeassistant"
 
 IC_CATALOG = [
     {"domain": "petkit", "name": "小佩 PetKit",
-     "repo": "https://github.com/RobertD501/ha-petkit",
-     "zip_url": "https://github.com/RobertD501/ha-petkit/archive/refs/heads/main.zip",
-     "login": "password",
+     "repo": "RobertD502/home-assistant-petkit", "login": "password",
      "desc": "猫砂盆/喂食器/饮水机等小佩设备，账号密码登录"},
     {"domain": "xiaomi_miot", "name": "小米米家 xiaomi_miot",
-     "repo": "https://github.com/al-one/hass-xiaomi-miot",
-     "zip_url": "https://github.com/al-one/hass-xiaomi-miot/archive/refs/heads/master.zip",
-     "login": "password",
-     "desc": "小米账号密码登录，米家设备覆盖广（你现有小米设备即此方案可替换）"},
+     "repo": "al-one/hass-xiaomi-miot", "login": "password",
+     "desc": "小米账号密码登录，米家设备覆盖广（社区维护版）"},
     {"domain": "xiaomi_home", "name": "小米官方 ha_xiaomi_home",
-     "repo": "https://github.com/XiaoMi/ha_xiaomi_home",
-     "zip_url": "https://github.com/XiaoMi/ha_xiaomi_home/archive/refs/heads/main.zip",
-     "login": "oauth",
+     "repo": "XiaoMi/ha_xiaomi_home", "login": "oauth",
      "desc": "小米官方维护；登录需跳转小米授权页一次（OAuth）"},
     {"domain": "tuya", "name": "涂鸦 Tuya", "core": True,
      "login": "oauth",
-     "desc": "大量贴牌智能设备；需涂鸦开发者账号，OAuth 授权，无需安装"},
+     "desc": "大量贴牌智能设备；HA 内置集成，无需安装，直接配置"},
 ]
 
 _IC_STATE = {"state": "idle", "msg": "", "domain": ""}
@@ -758,6 +757,75 @@ def _ha_api(method: str, path: str, payload: dict | None = None) -> tuple[int, d
         return 0, {"message": f"{type(e).__name__}: {e}"}
 
 
+# ---- HA 探活 / 启动（面板上可直接拉起 HA，省得去双击 bat） ----
+
+_HA_EXE_CANDIDATES = (
+    r"C:\Python312\Scripts\hass.exe",
+    r"C:\Python311\Scripts\hass.exe",
+    r"C:\Python310\Scripts\hass.exe",
+)
+
+
+def ha_alive() -> bool:
+    """HA 的 /api/ 是否可用（不需要令牌也能判断进程在不在）。"""
+    from urllib import error as urlerror, request as urlrequest
+
+    try:
+        with urlrequest.urlopen(f"{HA_BASE}/api/", timeout=3) as r:
+            return r.status in (200, 401)
+    except urlerror.HTTPError as e:
+        return e.code == 401
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def ha_start() -> dict:
+    """后台拉起 HA（hass.exe），成功返回 launched。"""
+    import subprocess
+
+    if ha_alive():
+        return {"ok": True, "msg": "HA 已在运行"}
+
+    exe = None
+    for p in _HA_EXE_CANDIDATES:
+        if Path(p).is_file():
+            exe = p
+            break
+    if exe is None:
+        import shutil
+        exe = shutil.which("hass")
+    if exe is None:
+        return {"ok": False, "error": "找不到 hass.exe，请确认 Python 环境或手动双击 start_ha.bat"}
+
+    # 脱离控制台启动，voice_bridge 退出后 HA 仍存活
+    flags = 0
+    if os.name == "nt":
+        flags = 0x00000008 | 0x00000200   # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    try:
+        subprocess.Popen(
+            [exe, "--config", str(HA_CONFIG_DIR), "--ignore-os-check"],
+            cwd=str(HA_CONFIG_DIR), creationflags=flags,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, close_fds=True,
+        )
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"启动失败: {e}"}
+    log.info("已尝试启动 Home Assistant（约 1~2 分钟就绪）")
+    return {"ok": True, "msg": "已启动，约 1~2 分钟就绪"}
+
+
+async def _ic_restart_ha(timeout_s: int = 300) -> None:
+    """重启 HA 并等它回来。"""
+    if not ha_alive():
+        await asyncio.sleep(1)
+    call_ha("homeassistant/restart", {})
+    for _ in range(max(1, timeout_s // 5)):
+        await asyncio.sleep(5)
+        if _ha_api("GET", "/api/", None)[0] == 200:
+            return
+    raise ValueError("HA 重启后 5 分钟未恢复，请手动查看 HA 日志")
+
+
 def _ic_download(url: str) -> bytes:
     """下载集成压缩包；GitHub 直连失败时自动尝试镜像加速。"""
     last = None
@@ -776,49 +844,203 @@ def _ic_download(url: str) -> bytes:
     raise ValueError(f"下载失败: {last}")
 
 
-async def ic_install(domain: str) -> None:
-    """安装任务：下载 -> 解压到 custom_components -> 重启 HA -> 等恢复。"""
+def _ic_unzip(data: bytes) -> tuple[str, dict]:
+    """从压缩包里定位 custom_components/<domain>/，返回 (domain, {相对路径: 内容})。"""
     import io
     import zipfile
 
-    entry = next((e for e in IC_CATALOG if e["domain"] == domain), None)
-    if not entry:
-        raise ValueError("清单里没有这个集成")
-    if entry.get("core"):
+    zin = zipfile.ZipFile(io.BytesIO(data))
+    names = [n.replace("\\", "/") for n in zin.namelist() if not n.endswith("/")]
+
+    # 找最浅的一句 custom_components/<x>/manifest.json
+    best = None      # (深度, 目录名, manifest 路径)
+    for n in names:
+        p = n.split("/")
+        if p[-1] != "manifest.json" or "custom_components" not in p:
+            continue
+        j = len(p) - 1 - p[::-1].index("custom_components")
+        if len(p) <= j + 2:
+            continue
+        if best is None or j < best[0]:
+            best = (j, p[j + 1], n)
+    if best is None:
+        raise ValueError("这不是 Home Assistant 自定义集成："
+                         "压缩包里找不到 custom_components/<集成名>/manifest.json")
+
+    _, dirname, mpath = best
+    try:
+        manifest = json.loads(zin.read(mpath).decode("utf-8", "replace"))
+    except Exception:  # noqa: BLE001
+        manifest = {}
+    domain = str(manifest.get("domain") or dirname).strip()
+
+    files = {}
+    for n in names:
+        p = n.split("/")
+        if "custom_components" not in p:
+            continue
+        j = len(p) - 1 - p[::-1].index("custom_components")
+        if len(p) > j + 2 and p[j + 1] == dirname:
+            files["/".join(p[j + 2:])] = zin.read(n)
+    if not files:
+        raise ValueError("集成目录是空的，解压失败")
+    return domain, files
+
+
+def _gh_json(url: str) -> dict | list:
+    """请求 GitHub API（未鉴权，够用）。"""
+    from urllib import request as urlrequest
+
+    req = urlrequest.Request(url, headers={
+        "User-Agent": "voice-bridge", "Accept": "application/vnd.github+json"})
+    with urlrequest.urlopen(req, timeout=30) as r:
+        return json.loads(r.read().decode("utf-8", "replace"))
+
+
+def ic_search(q: str, limit: int = 15) -> list:
+    """搜索 GitHub 上的 Home Assistant 自定义集成。"""
+    from urllib.parse import quote
+
+    q = (q or "").strip()
+    if not q:
+        return []
+    query = f"{q} home-assistant in:name,description,topics"
+    url = ("https://api.github.com/search/repositories?q=" + quote(query) +
+           f"&sort=stars&order=desc&per_page={max(limit, 20)}")
+    try:
+        data = _gh_json(url)
+    except Exception as e:  # noqa: BLE001
+        raise ValueError(f"GitHub 搜索失败（可能被墙/限流）: {e}")
+
+    out = []
+    tokens = [t for t in q.lower().replace("-", " ").split() if len(t) >= 2]
+    for it in (data.get("items") or []):
+        name = it.get("full_name") or ""
+        desc = (it.get("description") or "").strip()
+        topics = [t.lower() for t in (it.get("topics") or [])]
+        blob = f"{name} {desc} {' '.join(topics)}".lower()
+        # 必须同时满足：① 像 HA 集成 ② 命中用户关键词（否则搜 socket 会出来一堆无关项目）
+        ha_like = ("home assistant" in blob or "home-assistant" in blob or
+                   "homeassistant" in blob or "hass" in blob or
+                   "home-assistant" in topics or "homeassistant" in topics)
+        hit_kw = not tokens or any(t in blob for t in tokens)
+        if not (ha_like and hit_kw):
+            continue
+        # 相关性排序：仓库名命中 > 描述命中 > star 数
+        name_l = name.lower()
+        score = (3 if any(t in name_l for t in tokens) else 0) + \
+                (1 if any(t in desc.lower() for t in tokens) else 0) + \
+                min((it.get("stargazers_count") or 0) / 1000.0, 1.0)
+        out.append({"repo": name, "desc": desc[:160], "_score": score,
+                    "stars": it.get("stargazers_count", 0),
+                    "branch": it.get("default_branch", "main"),
+                    "updated": (it.get("pushed_at") or "")[:10],
+                    "url": it.get("html_url", "")})
+    out.sort(key=lambda x: (-x["_score"], -x["stars"]))
+    for r in out:
+        r.pop("_score", None)
+    return out[:limit]
+
+
+def _ic_repo_zip(repo: str) -> str:
+    """把 owner/name 或 GitHub 链接规范成 zip 下载地址。"""
+    repo = (repo or "").strip().rstrip("/")
+    for pre in ("https://github.com/", "http://github.com/", "github.com/"):
+        if repo.startswith(pre):
+            repo = repo[len(pre):]
+    if repo.endswith(".zip"):
+        return "https://github.com/" + repo
+    if repo.endswith(".git"):
+        repo = repo[:-4]
+    if repo.count("/") != 1:
+        raise ValueError("仓库格式应为 owner/name，例如 RobertD501/ha-petkit")
+    try:
+        info = _gh_json(f"https://api.github.com/repos/{repo}")
+        branch = info.get("default_branch") or "main"
+    except Exception:  # noqa: BLE001
+        branch = "main"
+    return f"https://github.com/{repo}/archive/refs/heads/{branch}.zip"
+
+
+async def ic_install(domain: str = "", repo: str = "") -> None:
+    """安装任务：下载 -> 解压到 custom_components -> 重启 HA -> 等恢复。
+
+    domain 走内置推荐清单；repo 走用户自己搜索/粘贴的仓库。
+    """
+    entry = next((e for e in IC_CATALOG if e["domain"] == domain), None) if domain else None
+    if entry and entry.get("core"):
         _IC_STATE.update(state="done", domain=domain,
                          msg="核心集成无需安装，直接点「配置 / 登录」")
         return
+    if entry:
+        zip_url = await asyncio.to_thread(_ic_repo_zip, entry["repo"])
+    elif repo:
+        zip_url = await asyncio.to_thread(_ic_repo_zip, repo)
+    else:
+        raise ValueError("缺少要安装的集成（domain 或 repo）")
 
-    _IC_STATE.update(state="downloading", domain=domain, msg="正在下载集成…")
-    data = await asyncio.to_thread(_ic_download, entry["zip_url"])
+    _IC_STATE.update(state="downloading", domain=domain, repo=repo,
+                     msg=f"正在下载 {repo or domain} …")
+    data = await asyncio.to_thread(_ic_download, zip_url)
 
     _IC_STATE.update(state="extracting", msg="正在解压安装…")
-    prefix = f"custom_components/{domain}/"
-    dest = HA_CONFIG_DIR / "custom_components" / domain
-    zin = zipfile.ZipFile(io.BytesIO(data))
-    members = [n for n in zin.namelist()
-               if prefix in n and not n.endswith("/")]
-    if not members:
-        raise ValueError("压缩包里没找到集成目录，可能仓库结构已变化")
-    cut = members[0].split(prefix)[0] + prefix
+    real_domain, files = _ic_unzip(data)
+    if real_domain in ("", ".", "..") or "/" in real_domain:
+        raise ValueError(f"集成域名异常: {real_domain!r}")
+    dest = HA_CONFIG_DIR / "custom_components" / real_domain
     dest.mkdir(parents=True, exist_ok=True)
-    for n in members:
-        rel = n[len(cut):]
-        (dest / rel).parent.mkdir(parents=True, exist_ok=True)
-        (dest / rel).write_bytes(zin.read(n))
+    for rel, content in files.items():
+        f = dest / rel
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_bytes(content)
+    log.info("集成已解压: %s -> %s (%d 个文件)", repo or domain, dest, len(files))
 
-    _IC_STATE.update(state="restarting", msg="安装完成，正在重启 HA（约 1 分钟）…")
-    call_ha("homeassistant/restart", {})
-    for _ in range(60):
-        await asyncio.sleep(5)
-        code, _d = _ha_api("GET", "/api/")
-        if code == 200:
-            break
+    _IC_STATE.update(state="restarting", domain=real_domain,
+                     msg="安装完成，正在重启 HA（约 1 分钟）…")
+    await _ic_restart_ha()
+
+    _IC_STATE.update(state="done", domain=real_domain, repo=repo,
+                     msg=f"✅ {real_domain} 安装完成，点「配置 / 登录」接入账号")
+
+
+async def ic_uninstall(domain: str) -> None:
+    """卸载自定义集成：删配置条目 -> 删目录 -> 重启 HA。"""
+    import shutil
+
+    domain = (domain or "").strip()
+    if not domain or "/" in domain or domain in (".", ".."):
+        raise ValueError("集成域名无效")
+
+    dest = HA_CONFIG_DIR / "custom_components" / domain
+    if not dest.is_dir():
+        raise ValueError(f"没有找到可卸载的自定义集成 {domain}"
+                         "（HA 内置集成不能这样卸载）")
+
+    # 先删掉该域下的配置条目，否则 HA 重启会报「集成未找到」
+    removed = 0
+    if ha_alive():
+        _IC_STATE.update(state="removing", domain=domain, msg="正在移除配置条目…")
+        _s, entries = _ha_api("GET", "/api/config/config_entries/entry")
+        if isinstance(entries, list):
+            for e in entries:
+                if e.get("domain") == domain:
+                    _ha_api("DELETE",
+                            f"/api/config/config_entries/entry/{e.get('entry_id')}")
+                    removed += 1
+
+    _IC_STATE.update(state="removing", domain=domain,
+                     msg=f"正在删除集成文件（已移除 {removed} 个配置条目）…")
+    await asyncio.to_thread(shutil.rmtree, dest, True)
+    log.info("已卸载集成: %s (配置条目 %d 个)", domain, removed)
+
+    if ha_alive():
+        _IC_STATE.update(state="restarting", msg="已删除，正在重启 HA…")
+        await _ic_restart_ha()
+        _IC_STATE.update(state="done", domain="",
+                         msg=f"✅ {domain} 已卸载并重启 HA")
     else:
-        raise ValueError("HA 重启后 5 分钟未恢复，请手动查看 HA 日志")
-
-    _IC_STATE.update(state="done", domain=domain,
-                     msg="✅ 安装完成，点「配置 / 登录」接入你的账号")
+        _IC_STATE.update(state="done", domain="",
+                         msg=f"✅ {domain} 已删除（HA 未运行，下次启动即生效）")
 
 
 async def ic_flow_start(handler: str) -> dict:
@@ -1028,12 +1250,39 @@ PANEL_HTML = r"""<!DOCTYPE html>
   </div>
 </div>
 <div id="tab-ic" class="tab" style="display:none">
+  <div class="card" id="ha-down-card" style="display:none; border-color:#f6ad55; background:#fffaf0">
+    <h3>⚠️ Home Assistant 没有运行</h3>
+    <div class="hint" style="margin-bottom:8px">
+      面板的所有设备动作都要靠 HA 执行，HA 关着就会一直报「连接被拒绝」。
+    </div>
+    <button class="pri" onclick="haStart()">启动 Home Assistant</button>
+    <div class="msg" id="msg-ha"></div>
+  </div>
   <div class="card">
-    <h3>我的集成</h3>
+    <h3>我的集成（可卸载）</h3>
     <div id="ic-installed">加载中…</div>
   </div>
   <div class="card">
-    <h3>添加品牌（自动下载驱动 → 重启 HA → 面板内登录）</h3>
+    <h3>搜索集成并安装</h3>
+    <div class="hint" style="margin-bottom:8px">
+      搜 GitHub 上的 Home Assistant 集成（关键词：品牌名 / 设备名 / 功能）。安装 = 下载驱动 →
+      自动重启 HA，装好后回到这里点「配置 / 登录」。
+    </div>
+    <div class="row">
+      <input type="text" id="ic-q" placeholder="例如 petkit、tuya、govee、智能插座…"
+             style="flex:1" onkeydown="if(event.key==='Enter')icSearch()">
+      <button class="pri" onclick="icSearch()">搜索</button>
+    </div>
+    <div id="ic-results"></div>
+    <div class="hint" style="margin-top:10px">
+      也可以直接粘贴仓库地址/名称安装：
+      <input type="text" id="ic-repo" placeholder="owner/repo 或 https://github.com/owner/repo"
+             style="width:60%">
+      <button class="act" onclick="icInstallRepo()">安装</button>
+    </div>
+  </div>
+  <div class="card">
+    <h3>推荐（常用集成，一键安装）</h3>
     <div id="ic-catalog">加载中…</div>
     <div class="msg" id="msg-ic"></div>
   </div>
@@ -1338,9 +1587,12 @@ let IC_POLL_T = null;
 
 async function refreshIC() {
   const d = await jget('/api/ic/list');
+  $('ha-down-card').style.display = d.ha_alive ? 'none' : '';
   $('ic-installed').innerHTML = d.installed.length
-    ? '<table><tr><th>集成</th><th>版本</th></tr>' +
-      d.installed.map(i => `<tr><td>${i.name}（${i.domain}）</td><td>${i.version || '-'}</td></tr>`).join('') +
+    ? '<table><tr><th>集成</th><th>版本</th><th>操作</th></tr>' +
+      d.installed.map(i => `<tr><td>${i.name}（${i.domain}）</td><td>${i.version || '-'}</td>` +
+        `<td><button class="act" onclick="icFlow('${i.domain}')">配置</button> ` +
+        `<button class="act" style="color:#c53030" onclick="icUninstall('${i.domain}','${i.name}')">卸载</button></td></tr>`).join('') +
       '</table>'
     : '<p class="hint">还没有自定义集成</p>';
   $('ic-catalog').innerHTML = d.catalog.map(e => {
@@ -1353,19 +1605,70 @@ async function refreshIC() {
       `<b>${e.name}</b> ${badge}<br>` +
       `<span class="hint">${e.desc || ''}</span>` +
       `<div class="row" style="margin-top:6px">${btn}` +
-      (e.repo ? ` <a class="hint" href="${e.repo}" target="_blank">源码</a>` : '') +
+      (e.repo ? ` <a class="hint" href="https://github.com/${e.repo}" target="_blank">源码</a>` : '') +
       `</div></div>`;
   }).join('');
-  if (['downloading', 'extracting', 'restarting'].includes(d.state)) {
+  if (['downloading', 'extracting', 'restarting', 'removing'].includes(d.state)) {
     showMsg('msg-ic', d.msg, true);
     icPollState(true);
   }
 }
 
-async function icInstall(domain) {
-  const d = await jpost('/api/ic/install', {domain});
+async function haStart() {
+  showMsg('msg-ha', '正在启动 HA（约 1~2 分钟）…', true);
+  const d = await jpost('/api/ha/start', {});
   if (d.ok) {
-    showMsg('msg-ic', '安装任务已开始：下载 → 自动重启 HA → 等待恢复（约 1 分钟）', true);
+    showMsg('msg-ha', d.msg || '已启动', true);
+    let n = 0;
+    const t = setInterval(async () => {
+      const r = await jget('/api/ic/list');
+      if (r.ha_alive || ++n > 30) {
+        clearInterval(t);
+        if (r.ha_alive) { showMsg('msg-ha', 'HA 已就绪', true); refreshIC(); }
+      }
+    }, 5000);
+  } else showMsg('msg-ha', d.error || '启动失败', false);
+}
+
+async function icSearch() {
+  const q = $('ic-q').value.trim();
+  if (!q) return;
+  $('ic-results').innerHTML = '<p class="hint">搜索中…</p>';
+  const d = await jget('/api/ic/search?q=' + encodeURIComponent(q));
+  if (!d.ok) { $('ic-results').innerHTML = `<p style="color:#c53030">${d.error || '搜索失败'}</p>`; return; }
+  if (!d.results.length) {
+    $('ic-results').innerHTML = '<p class="hint">没有搜到合适的集成，换个关键词试试（英文品牌名更容易命中）</p>';
+    return;
+  }
+  $('ic-results').innerHTML = d.results.map(r =>
+    `<div style="border:1px solid #e5e5e5;border-radius:8px;padding:10px;margin:8px 0;cursor:default">` +
+    `<b>${r.repo}</b> <span class="hint">★ ${r.stars} · 更新 ${r.updated}</span><br>` +
+    `<span class="hint">${r.desc || '（无描述）'}</span>` +
+    `<div class="row" style="margin-top:6px">` +
+    `<button class="pri" onclick="icInstall('', '${r.repo}')">安装</button> ` +
+    `<a class="hint" href="${r.url}" target="_blank">GitHub</a></div></div>`).join('');
+}
+
+function icInstallRepo() {
+  const v = $('ic-repo').value.trim();
+  if (!v) return;
+  icInstall('', v);
+}
+
+async function icUninstall(domain, name) {
+  if (!confirm(`卸载「${name || domain}」？\n\n会删除 custom_components/${domain} 目录、`
+             + `移除该集成下的全部配置条目，并重启 HA。设备在 HA 里的实体也会消失。`)) return;
+  const d = await jpost('/api/ic/uninstall', {domain});
+  if (d.ok) {
+    showMsg('msg-ic', `正在卸载 ${domain}（删配置 → 删文件 → 重启 HA）…`, true);
+    icPollState();
+  } else showMsg('msg-ic', d.error || '卸载失败', false);
+}
+
+async function icInstall(domain, repo) {
+  const d = await jpost('/api/ic/install', {domain: domain || '', repo: repo || ''});
+  if (d.ok) {
+    showMsg('msg-ic', '安装任务已开始：下载 → 解压 → 自动重启 HA（约 1 分钟）', true);
     icPollState();
   } else showMsg('msg-ic', d.error || '失败', false);
 }
@@ -1466,7 +1769,8 @@ function showMsg(id, text, ok) {
 
 (async function init() {
   const s = await jget('/api/status');
-  $('status').textContent = `音箱：${s.speaker}（${s.hardware}）｜口令 ${s.commands} 条｜每 ${s.poll}s 轮询`;
+  $('status').textContent = `音箱：${s.speaker}（${s.hardware}）｜口令 ${s.commands} 条｜每 ${s.poll}s 轮询` +
+    (s.ha_alive ? '｜HA ✅' : '｜HA ❌ 未运行（去「集成中心」一键启动）');
   PANEL_ENTITIES = (await jget('/api/ha/entities')).entities || [];
   loadEntities();
   refreshCmds();
@@ -1512,12 +1816,24 @@ class _PanelHandler(BaseHTTPRequestHandler):
                             m = {}
                         installed.append({"domain": d.name,
                                           "name": m.get("name", d.name),
-                                          "version": m.get("version", "")})
+                                          "version": m.get("version", ""),
+                                          "repo": (m.get("documentation") or
+                                                   m.get("issue_tracker") or "")})
             domains = {i["domain"] for i in installed}
             catalog = [dict(e, installed=e["domain"] in domains or bool(e.get("core")))
                        for e in IC_CATALOG]
             self._send(200, {"installed": installed, "catalog": catalog,
+                             "ha_alive": ha_alive(),
                              "state": _IC_STATE["state"], "msg": _IC_STATE["msg"]})
+        elif self.path.startswith("/api/ic/search"):
+            from urllib.parse import parse_qs, urlparse
+            q = (parse_qs(urlparse(self.path).query).get("q") or [""])[0]
+            try:
+                results = ic_search(q)
+            except Exception as e:  # noqa: BLE001
+                return self._send(200, {"ok": False, "error": str(e)[:200],
+                                        "results": []})
+            self._send(200, {"ok": True, "results": results})
         elif self.path == "/api/ic/state":
             self._send(200, dict(_IC_STATE))
         elif self.path == "/api/login/state":
@@ -1527,6 +1843,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
             self._send(200, {"speaker": _speaker_info["name"] or "未知",
                              "hardware": _speaker_info["hardware"] or "?",
                              "logged_in": bool(_session["cookie"]),
+                             "ha_alive": ha_alive(),
                              "commands": len(COMMANDS), "poll": POLL_INTERVAL})
         else:
             self._send(404, {"error": "not found"})
@@ -1566,11 +1883,15 @@ class _PanelHandler(BaseHTTPRequestHandler):
             self._send(200, {"code": code, "body": resp[:120]})
         elif self.path == "/api/ic/install":
             if _IC_STATE["state"] not in ("idle", "done", "error"):
-                return self._send(400, {"ok": False, "error": "已有安装任务在进行"})
+                return self._send(400, {"ok": False, "error": "已有任务在进行"})
+            domain = str(body.get("domain", "") or "")
+            repo = str(body.get("repo", "") or "")
+            if not domain and not repo:
+                return self._send(400, {"ok": False, "error": "缺少 domain 或 repo"})
             _IC_STATE.update(state="downloading", msg="准备下载…",
-                             domain=str(body.get("domain", "")))
+                             domain=domain, repo=repo)
             fut = asyncio.run_coroutine_threadsafe(
-                ic_install(str(body.get("domain", ""))), _LOOP)
+                ic_install(domain, repo), _LOOP)
             # 只报启动成功与否，过程走 /api/ic/state 轮询
             def _on_done(f):
                 try:
@@ -1580,6 +1901,25 @@ class _PanelHandler(BaseHTTPRequestHandler):
                     log.warning("集成安装失败: %s", e)
             fut.add_done_callback(_on_done)
             self._send(200, {"ok": True, "state": "started"})
+        elif self.path == "/api/ic/uninstall":
+            if _IC_STATE["state"] not in ("idle", "done", "error"):
+                return self._send(400, {"ok": False, "error": "已有任务在进行"})
+            domain = str(body.get("domain", "") or "").strip()
+            if not domain:
+                return self._send(400, {"ok": False, "error": "缺少 domain"})
+            _IC_STATE.update(state="removing", domain=domain, msg="准备卸载…")
+            fut = asyncio.run_coroutine_threadsafe(ic_uninstall(domain), _LOOP)
+
+            def _on_done2(f):
+                try:
+                    f.result()
+                except Exception as e:  # noqa: BLE001
+                    _IC_STATE.update(state="error", msg=str(e)[:300])
+                    log.warning("卸载失败: %s", e)
+            fut.add_done_callback(_on_done2)
+            self._send(200, {"ok": True, "state": "started"})
+        elif self.path == "/api/ha/start":
+            self._send(200, ha_start())
         elif self.path == "/api/ic/flow":
             status, data = _ha_api("POST", "/api/config/config_entries/flow",
                                    {"handler": str(body.get("handler", ""))})
