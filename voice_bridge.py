@@ -203,6 +203,46 @@ def exec_command(cmd: dict) -> tuple[int, str]:
     return 0, "口令映射缺少 script/service 字段"
 
 
+# 集成 -> 品牌显示名。按实体「所属 HA 集成」分品牌，避免厂商名把同一
+# 集成的设备拆散（如小米米家集成下厂商有 小米/米家/小白 等多种）
+INTEGRATION_CANDIDATES = ["xiaomi_home", "xiaomi_miot", "miio", "petkit", "tuya",
+                          "mqtt", "esphome", "shelly", "switch_as_x", "template"]
+BRAND_LABELS = {"xiaomi_home": "小米米家", "xiaomi_miot": "小米米家",
+                "miio": "小米米家", "xiaomi": "小米米家", "mijia": "小米米家",
+                "petkit": "小佩 PetKit", "tuya": "涂鸦"}
+_ha_emap = {"value": {}, "exp": 0.0}   # 实体 -> 集成 映射缓存
+
+
+def _ha_integration_map() -> dict:
+    """返回 {entity_id: 集成域名}。用一次模板调用批量反查，缓存 10 分钟。"""
+    if _ha_emap["value"] and time.time() < _ha_emap["exp"]:
+        return _ha_emap["value"]
+    from urllib import request as urlrequest
+
+    doms = ", ".join(f"'{d}'" for d in INTEGRATION_CANDIDATES)
+    tpl = (
+        "{% set ns = namespace(out={}) %}"
+        f"{{% for dom in [{doms}] %}}"
+        "{% for eid in integration_entities(dom) %}"
+        "{% set ns.out = dict(ns.out, **{eid: dom}) %}"
+        "{% endfor %}{% endfor %}{{ ns.out | to_json }}"
+    )
+    try:
+        req = urlrequest.Request(
+            f"{HA_BASE}/api/template", method="POST",
+            data=json.dumps({"template": tpl}).encode(),
+            headers={"Authorization": f"Bearer {_ha_token_get()}",
+                     "Content-Type": "application/json"},
+        )
+        with urlrequest.urlopen(req, timeout=30) as r:
+            _ha_emap["value"] = json.loads(r.read().decode("utf-8", "replace"))
+        _ha_emap["exp"] = time.time() + 600
+    except Exception as e:  # noqa: BLE001
+        log.warning("拉取集成映射失败(品牌将按厂商显示): %s", e)
+        _ha_emap["exp"] = time.time() + 60
+    return _ha_emap["value"]
+
+
 def ha_get_states() -> list:
     """拉取 HA 实体列表（面板用），只保留可直接操作的域。"""
     from urllib import error as urlerror, request as urlrequest
@@ -231,8 +271,7 @@ def ha_get_states() -> list:
             item["state"] = s.get("state")
         out.append(item)
 
-    # 设备/品牌归属：REST states 不带设备信息，用 /api/template 一次拿全
-    # （device_id() -> 设备名、platform -> 所属集成，即"品牌"）。
+    # 设备名归属：REST states 不带设备信息，用 /api/template 一次拿全
     # 注意：Jinja 循环内 set 不出作用域，必须用 namespace 带出循环
     tpl = (
         "{% set ns = namespace(out={}) %}"
@@ -240,7 +279,7 @@ def ha_get_states() -> list:
         "{% if did %}{% set dev = device_attr(did, 'name_by_user') or "
         "device_attr(did, 'name') or did %}"
         "{% set ns.out = dict(ns.out, **{s.entity_id: {'d': dev, 'b': "
-        "device_attr(did, 'platform') or device_attr(did, 'manufacturer') or ''}}) %}"
+        "device_attr(did, 'manufacturer') or ''}}) %}"
         "{% endif %}{% endfor %}{{ ns.out | to_json }}"
     )
     dmap = {}
@@ -256,14 +295,19 @@ def ha_get_states() -> list:
     except Exception as e:  # noqa: BLE001
         log.warning("拉取设备分组失败(改用扁平模式): %s", e)
 
+    emap = _ha_integration_map()
     for item in out:
         info = dmap.get(item["entity_id"]) or {}
         if item["domain"] == "script":
             item["brand"] = "脚本"
             item["device"] = item["name"]
         else:
-            item["brand"] = (str(info.get("b", "")).strip()
-                             or "其他设备").title() if info else "其他设备"
+            dom = emap.get(item["entity_id"])
+            if dom:
+                item["brand"] = BRAND_LABELS.get(dom, dom)
+            else:
+                mfr = str(info.get("b", "")).strip()
+                item["brand"] = mfr or "其他设备"
             item["device"] = str(info.get("d", "")).strip() or item["name"]
 
     out.sort(key=lambda x: (x["brand"], x["device"], x["name"]))
@@ -615,6 +659,10 @@ PANEL_HTML = r"""<!DOCTYPE html>
       <label>选择选项（选项类指令需要）</label>
       <select id="sel-option"></select>
     </div>
+    <div style="margin-top:10px; padding-top:8px; border-top:1px dashed var(--bd, #ddd)">
+      <label>或直接选择 HA 脚本（可选，与上面二选一）</label>
+      <select id="sel-script"><option value="">— 不使用脚本 —</option></select>
+    </div>
     <div class="hint" style="margin-top:8px" id="entity-preview"></div>
   </div>
   <div class="card">
@@ -709,17 +757,32 @@ const DOMAIN_LABEL = {button:'按钮', select:'选项', switch:'开关', vacuum:
 const dlabel = d => DOMAIN_LABEL[d] || d;
 
 async function loadEntities() {
-  const selB = $('sel-brand');
+  const selB = $('sel-brand'), selS = $('sel-script');
   if (!PANEL_ENTITIES.length) {
     selB.innerHTML = '<option value="">HA 实体加载失败（HA 未运行？）</option>';
     return;
   }
-  const brands = [...new Set(PANEL_ENTITIES.map(e => e.brand))];
+  const nonScript = PANEL_ENTITIES.filter(e => e.brand !== '脚本');
+  const brands = [...new Set(nonScript.map(e => e.brand))];
   brands.sort((a, b) => a.localeCompare(b, 'zh'));
   selB.innerHTML = '<option value="">— 请选择 —</option>' +
-    brands.map(b => `<option value="${b}">${b}（${PANEL_ENTITIES.filter(e => e.brand === b).length} 条指令）</option>`).join('');
+    brands.map(b => `<option value="${b}">${b}（${nonScript.filter(e => e.brand === b).length} 条指令）</option>`).join('');
   selB.disabled = false;
+  const scripts = PANEL_ENTITIES.filter(e => e.brand === '脚本');
+  selS.innerHTML = '<option value="">— 不使用脚本 —</option>' +
+    scripts.map(e => `<option value="${e.entity_id}">${e.name}</option>`).join('');
 }
+
+$('sel-script').onchange = () => {
+  const sid = $('sel-script').value;
+  if (sid) {
+    $('sel-entity').value = '';
+    $('opt-wrap').style.display = 'none';
+    $('entity-preview').textContent = '动作：运行脚本 ' + sid;
+  } else {
+    $('entity-preview').textContent = '';
+  }
+};
 
 function onBrand() {
   const b = $('sel-brand').value;
@@ -756,6 +819,10 @@ function onDevice() {
 
 $('sel-entity').onchange = () => {
   const eid = $('sel-entity').value;
+  if (eid) {
+    $('sel-script').value = '';
+    $('entity-preview').textContent = '';
+  }
   const e = (PANEL_ENTITIES||[]).find(x => x.entity_id === eid);
   const domain = eid.split('.')[0];
   $('opt-wrap').style.display = domain === 'select' ? '' : 'none';
@@ -769,14 +836,16 @@ $('sel-entity').onchange = () => {
 let PANEL_ENTITIES = [];
 
 async function saveCmd() {
-  const eid = $('sel-entity').value;
+  const sid = $('sel-script').value;
+  const eid = sid ? '' : $('sel-entity').value;
   const kws = $('in-kw').value.split(/[,，]/).map(s => s.trim()).filter(Boolean);
   const show = (ok, t) => showMsg('msg-add', t, ok);
-  if (!eid) return show(false, '请先选择设备功能');
+  if (!sid && !eid) return show(false, '请先选择设备指令或 HA 脚本');
   if (!kws.length) return show(false, '请填写至少一个关键词');
   const domain = eid.split('.')[0];
   const cmd = {keywords: kws};
-  if (domain === 'button') { cmd.service = 'button/press'; cmd.data = {entity_id: eid}; }
+  if (sid) { cmd.script = sid.split('.')[1]; }
+  else if (domain === 'button') { cmd.service = 'button/press'; cmd.data = {entity_id: eid}; }
   else if (domain === 'select') { cmd.service = 'select/select_option';
     cmd.data = {entity_id: eid, option: $('sel-option').value}; }
   else if (domain === 'script') { cmd.script = eid.split('.')[1] || eid; }
