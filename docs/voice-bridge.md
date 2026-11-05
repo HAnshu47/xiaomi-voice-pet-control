@@ -67,23 +67,44 @@ PetKit 集成 → 小佩设备执行
    venv-voice\Scripts\python.exe voice_bridge.py --run
    ```
 
-## 添加口令：改 JSON 即可，自动热更新
+## 添加口令：改 JSON 或用管理面板
+
+### 方式一：Web 管理面板（推荐，MVP）
+
+启动后自动开启，浏览器访问 `http://127.0.0.1:8124`：
+
+- **口令列表**：查看/删除已配置的口令
+- **添加口令**：下拉选择 HA 设备功能（小佩的按钮、喂食选项、开关等，
+  自动从 HA 读取真实实体和友好名），填入触发关键词，保存即生效
+- **测试**：输入一句话模拟识别，立刻显示命中哪条口令，可手动执行验证
+- **日志**：实时滚动显示识别与执行情况
+
+面板直接把口令映射到设备服务（如 `button/press`），**不需要先在 HA 写脚本**；
+传统 `script` 映射依然支持。
+
+### 方式二：直接改 JSON
 
 `voice_bridge.json`（与脚本同目录，首次运行自动生成）：
 
 ```json
 {
   "commands": [
-    {"keywords": ["打扫猫砂盆", "清理猫砂盆", "铲屎"], "script": "cat_litter_clean"},
-    {"keywords": ["喂猫", "加餐"], "script": "cat_feed"}
+    {"keywords": ["清理猫砂盆"], "script": "cat_litter_clean"},
+    {"keywords": ["倒掉猫砂"], "service": "button/press",
+     "data": {"entity_id": "button.xxx_dump_litter"}}
   ]
 }
 ```
 
+两种映射写法：
+
+- `script`：调用 HA 脚本（`script.xxx`）
+- `service` + `data`：直接调用任意 HA 服务（button/press、select/select_option、
+  switch/turn_on……），无需建脚本
+
 - 命中规则：识别文本**包含**任一关键词即触发
 - 保存文件后约 2 秒内自动加载，无需重启（日志会提示「口令配置已热更新」）
 - 写错格式不会崩：沿用上一次的合法配置并在日志里提醒
-- `script` 对应 HA 里已有的脚本（`scripts.yaml` 或 UI 里建的）
 
 ## 设计细节
 

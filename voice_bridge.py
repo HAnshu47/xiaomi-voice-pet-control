@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 from collections import deque
 from logging.handlers import RotatingFileHandler
@@ -51,6 +52,10 @@ DEFAULT_COMMANDS = [
 HA_BASE = "http://127.0.0.1:8123"
 HA_AUTH_FILE = r"D:\xiaomi\homeassistant\.storage\auth"   # 自签 token 的凭据来源
 
+# Web 管理面板（口令管理/设备功能/测试/日志）。绑定本机回环，局域网不可见
+PANEL_HOST = "127.0.0.1"
+PANEL_PORT = 8124
+
 POLL_INTERVAL = 1.5     # 轮询间隔（秒）。低于 1 秒有风控风险
 COOLDOWN = 6.0          # 同一脚本两次触发的最小间隔（秒），防连喊重复执行
 MAX_BACKOFF = 60        # 出错后的最大退避（秒）
@@ -76,16 +81,30 @@ def _save_commands(cmds: list) -> None:
 def load_commands() -> list:
     """从 voice_bridge.json 读口令配置；文件不存在则创建默认配置。
 
-    命中规则：识别文本「包含」任一关键词即触发。
+    每条口令：keywords 必填；动作二选一：
+      - script: HA 脚本 ID（script.xxx）
+      - service: 直接调 HA 服务，如 "button/press"，data 里带 entity_id 等参数
     """
     if not COMMANDS_JSON.is_file():
         _save_commands(DEFAULT_COMMANDS)
-        return list(DEFAULT_COMMANDS)
+        return [dict(c) for c in DEFAULT_COMMANDS]
     try:
         data = json.loads(COMMANDS_JSON.read_text(encoding="utf-8"))
-        cmds = [{"keywords": [str(k) for k in c.get("keywords", [])],
-                 "script": str(c["script"])}
-                for c in data.get("commands", []) if c.get("script")]
+        cmds = []
+        for c in data.get("commands", []):
+            kws = [str(k).strip() for k in c.get("keywords", []) if str(k).strip()]
+            if not kws:
+                continue
+            entry: dict = {"keywords": kws}
+            if c.get("script"):
+                entry["script"] = str(c["script"])
+            elif c.get("service"):
+                entry["service"] = str(c["service"])
+                if c.get("data"):
+                    entry["data"] = c["data"]
+            else:
+                continue
+            cmds.append(entry)
         if cmds:
             return cmds
         log.warning("voice_bridge.json 里没有有效指令，沿用内置默认")
@@ -106,6 +125,25 @@ def setup_logging(verbose: bool) -> None:
     fh = RotatingFileHandler(LOG_PATH, maxBytes=1_000_000, backupCount=2, encoding="utf-8")
     fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     log.addHandler(fh)
+    _ring.setFormatter(fmt)
+    log.addHandler(_ring)
+
+
+class _RingHandler(logging.Handler):
+    """保留最近 N 条日志给 Web 面板展示。"""
+
+    def __init__(self, cap: int = 300):
+        super().__init__()
+        self.buf: deque = deque(maxlen=cap)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self.buf.append(self.format(record))
+        except Exception:  # noqa: BLE001
+            pass
+
+
+_ring = _RingHandler()
 
 
 # ---------------------------------------------------------------------------
@@ -136,14 +174,14 @@ def _ha_token_get() -> str:
     return _ha_token["value"]
 
 
-def call_ha_script(script: str) -> tuple[int, str]:
-    """调用 HA 脚本，返回 (http状态码, 响应文本)。不抛异常。"""
+def call_ha(action: str, data: dict) -> tuple[int, str]:
+    """调用 HA 服务（如 script/turn_on、button/press），返回 (http状态码, 响应)。不抛异常。"""
     from urllib import error as urlerror, request as urlrequest
 
-    url = f"{HA_BASE}/api/services/script/turn_on"
+    url = f"{HA_BASE}/api/services/{action}"
     req = urlrequest.Request(
         url, method="POST",
-        data=json.dumps({"entity_id": f"script.{script}"}).encode(),
+        data=json.dumps(data).encode(),
         headers={"Authorization": f"Bearer {_ha_token_get()}",
                  "Content-Type": "application/json"},
     )
@@ -154,6 +192,46 @@ def call_ha_script(script: str) -> tuple[int, str]:
         return e.code, e.read().decode("utf-8", "replace")[:200]
     except Exception as e:  # noqa: BLE001
         return 0, f"{type(e).__name__}: {e}"
+
+
+def exec_command(cmd: dict) -> tuple[int, str]:
+    """执行一条口令映射：优先 script，其次直接调设备服务。"""
+    if cmd.get("script"):
+        return call_ha("script/turn_on", {"entity_id": f"script.{cmd['script']}"})
+    if cmd.get("service"):
+        return call_ha(cmd["service"], dict(cmd.get("data") or {}))
+    return 0, "口令映射缺少 script/service 字段"
+
+
+def ha_get_states() -> list:
+    """拉取 HA 实体列表（面板用），只保留可直接操作的域。"""
+    from urllib import error as urlerror, request as urlrequest
+
+    req = urlrequest.Request(
+        f"{HA_BASE}/api/states",
+        headers={"Authorization": f"Bearer {_ha_token_get()}"},
+    )
+    try:
+        with urlrequest.urlopen(req, timeout=15) as r:
+            states = json.loads(r.read().decode("utf-8", "replace"))
+    except Exception as e:  # noqa: BLE001
+        log.warning("拉取 HA 实体失败: %s", e)
+        return []
+    keep = {"button", "select", "switch", "vacuum", "script", "fan", "light"}
+    out = []
+    for s in states:
+        domain = s["entity_id"].split(".", 1)[0]
+        if domain not in keep:
+            continue
+        item = {"entity_id": s["entity_id"], "domain": domain,
+                "name": s.get("attributes", {}).get("friendly_name", s["entity_id"])}
+        if domain == "select":
+            item["options"] = s.get("attributes", {}).get("options", [])
+        if domain == "switch":
+            item["state"] = s.get("state")
+        out.append(item)
+    out.sort(key=lambda x: (x["domain"], x["name"]))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -277,6 +355,8 @@ async def build_session(use_password: bool = False) -> tuple:
     cookie = {"userId": token["userId"],
               "serviceToken": token["micoapi"][1],
               "deviceId": chosen["id"]}
+    _speaker_info.update({"name": chosen["name"], "hardware": chosen["hardware"],
+                          "id": chosen["id"]})
     return account, cookie, chosen["hardware"], chosen["id"], chosen["name"]
 
 
@@ -323,17 +403,17 @@ def save_state(st: dict) -> None:
 _last_fired: dict[str, float] = {}
 
 
-def dispatch(text: str) -> str | None:
-    """把识别文本匹配到脚本。返回脚本名或 None。"""
+def match_command(text: str) -> dict | None:
+    """把识别文本匹配到口令映射。返回命中的命令或 None（含冷却控制）。"""
     for cmd in COMMANDS:
         if any(k in text for k in cmd["keywords"]):
-            script = cmd["script"]
+            label = cmd.get("script") or cmd.get("service") or "?"
             now = time.time()
-            if now - _last_fired.get(script, 0) < COOLDOWN:
-                log.info("口令「%s」命中 %s，但在冷却期内，跳过", text, script)
+            if now - _last_fired.get(label, 0) < COOLDOWN:
+                log.info("口令「%s」命中 %s，但在冷却期内，跳过", text, label)
                 return None
-            _last_fired[script] = now
-            return script
+            _last_fired[label] = now
+            return cmd
     return None
 
 
@@ -380,11 +460,12 @@ async def poll_loop(hardware: str, cookie: dict, probe_seconds: float = 0) -> No
                     log.info("[记录] %s", text)
                     continue
                 log.info("识别到：%s", text)
-                script = dispatch(text)
-                if script is None:
+                cmd = match_command(text)
+                if cmd is None:
                     continue
-                code, body = call_ha_script(script)
-                log.info("HA %s -> HTTP %s %s", script, code, body[:80])
+                label = cmd.get("script") or cmd.get("service")
+                code, body = exec_command(cmd)
+                log.info("HA %s -> HTTP %s %s", label, code, body[:80])
                 if code != 200:
                     log.warning("HA 调用失败，保留时间戳以避免重复；下次重试请手动喊一次")
             if seen_set:
@@ -407,6 +488,377 @@ async def poll_loop(hardware: str, cookie: dict, probe_seconds: float = 0) -> No
         await asyncio.sleep(POLL_INTERVAL)
 
 
+# ---------------------------------------------------------------------------
+# Web 管理面板（127.0.0.1:8124）
+# ---------------------------------------------------------------------------
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+_speaker_info = {"name": "", "hardware": "", "id": ""}
+
+PANEL_HTML = r"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>voice_bridge 管理面板</title>
+<style>
+  :root { --bd:#e2e8f0; --bg:#f7f8fa; --main:#2b6cb0; --ok:#276749; --err:#c53030; }
+  * { box-sizing:border-box; }
+  body { font-family:"Microsoft YaHei",system-ui,sans-serif; margin:0; background:var(--bg); color:#1a202c; }
+  header { background:#fff; border-bottom:1px solid var(--bd); padding:14px 20px; display:flex; align-items:center; gap:14px; }
+  header h1 { font-size:18px; margin:0; }
+  header .status { font-size:13px; color:#4a5568; }
+  nav { display:flex; gap:4px; padding:10px 20px 0; background:#fff; border-bottom:1px solid var(--bd); }
+  nav button { border:none; background:none; padding:10px 16px; font-size:14px; cursor:pointer;
+               border-bottom:2px solid transparent; color:#4a5568; }
+  nav button.on { color:var(--main); border-bottom-color:var(--main); font-weight:600; }
+  main { max-width:860px; margin:20px auto; padding:0 16px; }
+  .card { background:#fff; border:1px solid var(--bd); border-radius:10px; padding:16px 18px; margin-bottom:16px; }
+  .card h3 { margin:0 0 12px; font-size:15px; }
+  table { width:100%; border-collapse:collapse; font-size:14px; }
+  th,td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--bd); vertical-align:top; }
+  th { color:#718096; font-weight:600; font-size:13px; }
+  .kw { display:inline-block; background:#ebf4ff; color:var(--main); border-radius:4px;
+        padding:2px 8px; margin:2px 4px 2px 0; font-size:13px; }
+  button.act { border:1px solid var(--bd); background:#fff; border-radius:6px; padding:5px 12px;
+               cursor:pointer; font-size:13px; }
+  button.act:hover { border-color:var(--main); color:var(--main); }
+  button.pri { background:var(--main); color:#fff; border:none; border-radius:6px; padding:8px 18px;
+               cursor:pointer; font-size:14px; }
+  button.danger { color:var(--err); }
+  input[type=text], select { border:1px solid var(--bd); border-radius:6px; padding:8px 10px;
+               font-size:14px; width:100%; }
+  label { display:block; font-size:13px; color:#4a5568; margin:12px 0 4px; }
+  .hint { font-size:12.5px; color:#718096; line-height:1.7; }
+  .msg { padding:8px 12px; border-radius:6px; font-size:13.5px; margin:10px 0; display:none; }
+  .msg.ok { background:#f0fff4; color:var(--ok); display:block; }
+  .msg.err { background:#fff5f5; color:var(--err); display:block; }
+  pre.log { background:#1a202c; color:#a0aec0; font-size:12px; padding:14px; border-radius:8px;
+            max-height:420px; overflow-y:auto; margin:0; white-space:pre-wrap; word-break:break-all; }
+  pre.guide { background:#f6f8fa; border:1px dashed var(--bd); border-radius:8px; padding:12px;
+              font-size:13px; white-space:pre-wrap; }
+  .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  .row > * { flex:1; }
+  .row > button { flex:0 0 auto; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🐾 voice_bridge</h1>
+  <span class="status" id="status">加载中…</span>
+</header>
+<nav>
+  <button data-tab="list" class="on">口令列表</button>
+  <button data-tab="add">添加口令</button>
+  <button data-tab="test">测试</button>
+  <button data-tab="log">日志</button>
+</nav>
+<main>
+
+<div id="tab-list" class="tab">
+  <div class="card">
+    <h3>已配置的口令</h3>
+    <div id="cmdlist">加载中…</div>
+  </div>
+  <div class="card hint">
+    <b>说明</b>：口令识别基于「小爱对话记录」，音箱回复内容由训练计划决定，二者互不影响。
+    删除口令不会影响音箱说话，只影响设备动作。
+  </div>
+</div>
+
+<div id="tab-add" class="tab" style="display:none">
+  <div class="card">
+    <h3>① 选择设备功能</h3>
+    <label>HA 设备功能（按钮 / 选项 / 开关 / 脚本）</label>
+    <select id="sel-entity"><option value="">加载 HA 实体中…</option></select>
+    <div id="opt-wrap" style="display:none">
+      <label>选择选项（select 类设备需要）</label>
+      <select id="sel-option"></select>
+    </div>
+    <div class="hint" style="margin-top:8px" id="entity-preview"></div>
+  </div>
+  <div class="card">
+    <h3>② 填写小爱口令</h3>
+    <label>触发关键词（用逗号分隔，识别文本「包含」关键词即触发）</label>
+    <input type="text" id="in-kw" placeholder="例如：倒掉猫砂, 换猫砂">
+    <div class="hint">小爱同学不认识这些词也没关系，bridge 只看对话记录里的原文。</div>
+  </div>
+  <div class="card">
+    <h3>③ 保存</h3>
+    <div class="row">
+      <button class="pri" onclick="saveCmd()">保存口令</button>
+      <button class="act" onclick="copyGuide()">复制训练计划指引</button>
+    </div>
+    <div class="msg" id="msg-add"></div>
+    <pre class="guide" id="guide" style="display:none"></pre>
+  </div>
+</div>
+
+<div id="tab-test" class="tab" style="display:none">
+  <div class="card">
+    <h3>模拟识别测试</h3>
+    <label>输入一句你会对小爱说的话</label>
+    <input type="text" id="in-test" placeholder="例如：小爱同学，倒掉猫砂">
+    <div class="row" style="margin-top:12px">
+      <button class="pri" onclick="testMatch()">检测匹配</button>
+      <button class="act" onclick="execMatch()">执行命中的动作</button>
+    </div>
+    <div class="msg" id="msg-test"></div>
+    <pre class="guide" id="test-out" style="display:none"></pre>
+  </div>
+</div>
+
+<div id="tab-log" class="tab" style="display:none">
+  <div class="card">
+    <h3>实时日志（每 2 秒刷新）</h3>
+    <pre class="log" id="logbox">…</pre>
+  </div>
+</div>
+
+</main>
+<script>
+let CMDS = [];
+let TEST_HIT = null;
+const $ = id => document.getElementById(id);
+
+document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
+  document.querySelectorAll('nav button').forEach(x => x.classList.remove('on'));
+  b.classList.add('on');
+  document.querySelectorAll('.tab').forEach(t => t.style.display = 'none');
+  $('tab-' + b.dataset.tab).style.display = '';
+  if (b.dataset.tab === 'log') refreshLog();
+  if (b.dataset.tab === 'list') refreshCmds();
+});
+
+async function jget(url) { const r = await fetch(url); return r.json(); }
+async function jpost(url, data) {
+  const r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'},
+                              body: JSON.stringify(data)});
+  return r.json();
+}
+
+function targetLabel(c) {
+  if (c.script) return '脚本 script.' + c.script;
+  if (c.service) return '服务 ' + c.service + ' ← ' + ((c.data||{}).entity_id || '');
+  return '?';
+}
+
+async function refreshCmds() {
+  const d = await jget('/api/commands');
+  CMDS = d.commands || [];
+  const el = $('cmdlist');
+  if (!CMDS.length) { el.innerHTML = '<p class="hint">还没有口令，去「添加口令」建一条。</p>'; return; }
+  el.innerHTML = '<table><tr><th>关键词</th><th>动作</th><th></th></tr>' +
+    CMDS.map((c, i) =>
+      `<tr><td>${c.keywords.map(k => `<span class="kw">${k}</span>`).join('')}</td>` +
+      `<td style="font-size:13px">${targetLabel(c)}</td>` +
+      `<td><button class="act danger" onclick="delCmd(${i})">删除</button></td></tr>`).join('') +
+    '</table>';
+}
+
+async function delCmd(i) {
+  if (!confirm('删除这条口令？')) return;
+  CMDS.splice(i, 1);
+  const d = await jpost('/api/commands', {commands: CMDS});
+  showMsg('msg-add', d.ok ? '已删除' : (d.error || '失败'), d.ok);
+  refreshCmds();
+}
+
+async function loadEntities() {
+  const d = await jget('/api/ha/entities');
+  const sel = $('sel-entity');
+  const groups = {};
+  (d.entities || []).forEach(e => {
+    const g = {button:'按钮', select:'选项', switch:'开关', vacuum:'扫地/清洁', script:'脚本',
+               fan:'风扇', light:'灯'}[e.domain] || e.domain;
+    (groups[g] = groups[g] || []).push(e);
+  });
+  sel.innerHTML = '<option value="">— 请选择 —</option>' + Object.keys(groups).map(g =>
+    `<optgroup label="${g}">` + groups[g].map(e =>
+      `<option value="${e.entity_id}">${e.name}（${e.entity_id}）</option>`).join('') +
+    '</optgroup>').join('');
+}
+$('sel-entity').onchange = () => {
+  const eid = $('sel-entity').value;
+  const e = (PANEL_ENTITIES||[]).find(x => x.entity_id === eid);
+  const domain = eid.split('.')[0];
+  $('opt-wrap').style.display = domain === 'select' ? '' : 'none';
+  if (domain === 'select' && e) {
+    $('sel-option').innerHTML = (e.options||[]).map(o => `<option value="${o}">${o}</option>`).join('');
+  }
+  $('entity-preview').textContent = eid ? '动作：' + ({
+    button:'按下按钮', select:'切换到指定选项', switch:'开启',
+    vacuum:'执行服务', script:'运行脚本', fan:'开启', light:'开启'}[domain] || domain) : '';
+};
+let PANEL_ENTITIES = [];
+
+async function saveCmd() {
+  const eid = $('sel-entity').value;
+  const kws = $('in-kw').value.split(/[,，]/).map(s => s.trim()).filter(Boolean);
+  const show = (ok, t) => showMsg('msg-add', t, ok);
+  if (!eid) return show(false, '请先选择设备功能');
+  if (!kws.length) return show(false, '请填写至少一个关键词');
+  const domain = eid.split('.')[0];
+  const cmd = {keywords: kws};
+  if (domain === 'button') { cmd.service = 'button/press'; cmd.data = {entity_id: eid}; }
+  else if (domain === 'select') { cmd.service = 'select/select_option';
+    cmd.data = {entity_id: eid, option: $('sel-option').value}; }
+  else if (domain === 'script') { cmd.script = eid.split('.')[1] || eid; }
+  else { cmd.service = 'switch/turn_on'; cmd.data = {entity_id: eid}; }
+  const d = await jpost('/api/commands', {commands: CMDS.concat([cmd])});
+  if (d.ok) {
+    show(true, '已保存并生效');
+    $('in-kw').value = '';
+    CMDS.push(cmd);
+    $('guide').style.display = '';
+    $('guide').textContent = guideText(cmd);
+  } else show(false, d.error || '保存失败');
+}
+
+function guideText(cmd) {
+  const kws = cmd.keywords.join('「 或 」');
+  return `在小爱 App 创建同名词语（仅影响音箱回复，不做任何动作）：
+1. 打开「小爱音箱」App → 训练计划 → 创建训练计划
+2. 预设语句填：${kws}
+3. 小爱回复填：好的，马上执行（随意）
+4. 执行动作：什么都不要添加！动作由 voice_bridge 完成
+5. 保存并启用`;
+}
+function copyGuide() {
+  navigator.clipboard.writeText($('guide').textContent || '先保存一条口令');
+  showMsg('msg-add', '指引已复制到剪贴板', true);
+}
+
+async function testMatch() {
+  const text = $('in-test').value.trim();
+  if (!text) return;
+  const d = await jpost('/api/test', {text});
+  TEST_HIT = d.match;
+  const out = $('test-out'); out.style.display = '';
+  if (d.match) {
+    out.textContent = '✅ 命中口令：\n' + JSON.stringify(d.match, null, 2);
+    showMsg('msg-test', '命中「' + d.match.keywords[0] + '」', true);
+  } else {
+    out.textContent = '❌ 没有命中任何口令';
+    showMsg('msg-test', '未命中', false);
+  }
+}
+async function execMatch() {
+  if (TEST_HIT == null) return showMsg('msg-test', '先检测匹配', false);
+  const idx = CMDS.findIndex(c => JSON.stringify(c) === JSON.stringify(TEST_HIT));
+  if (idx < 0) return showMsg('msg-test', '口令已变更，请重新检测', false);
+  const d = await jpost('/api/exec', {index: idx});
+  showMsg('msg-test', `执行结果：HTTP ${d.code} ${d.body || ''}`, d.code === 200);
+}
+
+async function refreshLog() {
+  const d = await jget('/api/logs');
+  const box = $('logbox');
+  const stick = box.scrollTop + box.clientHeight >= box.scrollHeight - 30;
+  box.textContent = (d.lines || []).join('\n') || '（暂无日志）';
+  if (stick) box.scrollTop = box.scrollHeight;
+}
+
+function showMsg(id, text, ok) {
+  const el = $(id);
+  el.className = 'msg ' + (ok ? 'ok' : 'err');
+  el.textContent = text;
+  setTimeout(() => { el.className = 'msg'; }, 4000);
+}
+
+(async function init() {
+  const s = await jget('/api/status');
+  $('status').textContent = `音箱：${s.speaker}（${s.hardware}）｜口令 ${s.commands} 条｜每 ${s.poll}s 轮询`;
+  PANEL_ENTITIES = (await jget('/api/ha/entities')).entities || [];
+  loadEntities();
+  refreshCmds();
+  setInterval(refreshLog, 2000);
+})();
+</script>
+</body>
+</html>
+"""
+
+
+class _PanelHandler(BaseHTTPRequestHandler):
+    """管理面板的 HTTP 处理器。仅响应本机回环地址。"""
+
+    def _send(self, code: int, body, ctype: str = "application/json; charset=utf-8") -> None:
+        raw = body if isinstance(body, bytes) else json.dumps(body, ensure_ascii=False).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def do_GET(self) -> None:  # noqa: N802
+        if self.path == "/":
+            self._send(200, PANEL_HTML.encode(), "text/html; charset=utf-8")
+        elif self.path == "/api/commands":
+            self._send(200, {"commands": COMMANDS})
+        elif self.path == "/api/logs":
+            self._send(200, {"lines": list(_ring.buf)})
+        elif self.path == "/api/ha/entities":
+            self._send(200, {"entities": ha_get_states()})
+        elif self.path == "/api/status":
+            self._send(200, {"speaker": _speaker_info["name"] or "未知",
+                             "hardware": _speaker_info["hardware"] or "?",
+                             "commands": len(COMMANDS), "poll": POLL_INTERVAL})
+        else:
+            self._send(404, {"error": "not found"})
+
+    def do_POST(self) -> None:  # noqa: N802
+        global COMMANDS
+        length = int(self.headers.get("Content-Length", 0))
+        try:
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except Exception:  # noqa: BLE001
+            return self._send(400, {"ok": False, "error": "bad json"})
+
+        if self.path == "/api/commands":
+            incoming = body.get("commands")
+            if not isinstance(incoming, list):
+                return self._send(400, {"ok": False, "error": "commands 必须是列表"})
+            # 复用 load_commands 的校验逻辑：先落盘再重读
+            _save_commands(incoming)
+            COMMANDS = load_commands()
+            log.info("面板更新口令配置，现在 %d 条", len(COMMANDS))
+            self._send(200, {"ok": True, "commands": len(COMMANDS)})
+        elif self.path == "/api/test":
+            text = str(body.get("text", ""))
+            cmd = None
+            for c in COMMANDS:
+                if any(k in text for k in c["keywords"]):
+                    cmd = c
+                    break
+            self._send(200, {"match": cmd})
+        elif self.path == "/api/exec":
+            try:
+                cmd = COMMANDS[int(body.get("index", -1))]
+            except (IndexError, ValueError, TypeError):
+                return self._send(400, {"ok": False, "error": "index 无效"})
+            code, resp = exec_command(cmd)
+            log.info("面板手动执行 %s -> HTTP %s", cmd.get("script") or cmd.get("service"), code)
+            self._send(200, {"code": code, "body": resp[:120]})
+        else:
+            self._send(404, {"error": "not found"})
+
+    def log_message(self, fmt, *args) -> None:  # 静默访问日志，只留业务日志
+        pass
+
+
+def start_panel() -> None:
+    """在后台线程启动管理面板 HTTP 服务。"""
+    try:
+        srv = ThreadingHTTPServer((PANEL_HOST, PANEL_PORT), _PanelHandler)
+    except OSError as e:
+        log.warning("面板启动失败(%s)，可能已被占用；若已有一个面板在跑可忽略", e)
+        return
+    threading.Thread(target=srv.serve_forever, daemon=True,
+                     name="panel").start()
+    log.info("管理面板已启动: http://%s:%d", PANEL_HOST, PANEL_PORT)
+
+
 async def main_async() -> None:
     ap = argparse.ArgumentParser(description="小爱语音 -> HA 桥接")
     ap.add_argument("--login", action="store_true", help="登录并保存令牌（默认免密：令牌/浏览器 passToken）")
@@ -425,6 +877,7 @@ async def main_async() -> None:
         return
 
     account, cookie, hardware, device_id, name = await build_session(args.password)
+    start_panel()
 
     if args.devices:
         from miservice import MiNAService
