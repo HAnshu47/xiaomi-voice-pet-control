@@ -230,7 +230,42 @@ def ha_get_states() -> list:
         if domain == "switch":
             item["state"] = s.get("state")
         out.append(item)
-    out.sort(key=lambda x: (x["domain"], x["name"]))
+
+    # 设备/品牌归属：REST states 不带设备信息，用 /api/template 一次拿全
+    # （device_id() -> 设备名、platform -> 所属集成，即"品牌"）
+    tpl = (
+        "{% set out = {} %}"
+        "{% for s in states %}{% set did = device_id(s.entity_id) %}"
+        "{% if did %}{% set dev = device_attr(did, 'name_by_user') or "
+        "device_attr(did, 'name') or did %}"
+        "{% set out = dict(out, **{s.entity_id: {'d': dev, 'b': "
+        "device_attr(did, 'platform') or device_attr(did, 'manufacturer') or ''}}) %}"
+        "{% endif %}{% endfor %}{{ out | to_json }}"
+    )
+    dmap = {}
+    try:
+        req2 = urlrequest.Request(
+            f"{HA_BASE}/api/template", method="POST",
+            data=json.dumps({"template": tpl}).encode(),
+            headers={"Authorization": f"Bearer {_ha_token_get()}",
+                     "Content-Type": "application/json"},
+        )
+        with urlrequest.urlopen(req2, timeout=20) as r:
+            dmap = json.loads(r.read().decode("utf-8", "replace"))
+    except Exception as e:  # noqa: BLE001
+        log.warning("拉取设备分组失败(改用扁平模式): %s", e)
+
+    for item in out:
+        info = dmap.get(item["entity_id"]) or {}
+        if item["domain"] == "script":
+            item["brand"] = "脚本"
+            item["device"] = item["name"]
+        else:
+            item["brand"] = (str(info.get("b", "")).strip()
+                             or "其他设备").title() if info else "其他设备"
+            item["device"] = str(info.get("d", "")).strip() or item["name"]
+
+    out.sort(key=lambda x: (x["brand"], x["device"], x["name"]))
     return out
 
 
@@ -568,11 +603,15 @@ PANEL_HTML = r"""<!DOCTYPE html>
 
 <div id="tab-add" class="tab" style="display:none">
   <div class="card">
-    <h3>① 选择设备功能</h3>
-    <label>HA 设备功能（按钮 / 选项 / 开关 / 脚本）</label>
-    <select id="sel-entity"><option value="">加载 HA 实体中…</option></select>
+    <h3>① 选择设备指令（品牌 → 设备 → 指令）</h3>
+    <label>品牌 / 集成</label>
+    <select id="sel-brand" onchange="onBrand()"><option value="">加载中…</option></select>
+    <label>设备</label>
+    <select id="sel-device" disabled onchange="onDevice()"><option value="">先选品牌</option></select>
+    <label>指令</label>
+    <select id="sel-entity" disabled><option value="">先选设备</option></select>
     <div id="opt-wrap" style="display:none">
-      <label>选择选项（select 类设备需要）</label>
+      <label>选择选项（选项类指令需要）</label>
       <select id="sel-option"></select>
     </div>
     <div class="hint" style="margin-top:8px" id="entity-preview"></div>
@@ -664,20 +703,56 @@ async function delCmd(i) {
   refreshCmds();
 }
 
+const DOMAIN_LABEL = {button:'按钮', select:'选项', switch:'开关', vacuum:'清洁',
+                      script:'脚本', fan:'风扇', light:'灯'};
+const dlabel = d => DOMAIN_LABEL[d] || d;
+
 async function loadEntities() {
-  const d = await jget('/api/ha/entities');
-  const sel = $('sel-entity');
-  const groups = {};
-  (d.entities || []).forEach(e => {
-    const g = {button:'按钮', select:'选项', switch:'开关', vacuum:'扫地/清洁', script:'脚本',
-               fan:'风扇', light:'灯'}[e.domain] || e.domain;
-    (groups[g] = groups[g] || []).push(e);
-  });
-  sel.innerHTML = '<option value="">— 请选择 —</option>' + Object.keys(groups).map(g =>
-    `<optgroup label="${g}">` + groups[g].map(e =>
-      `<option value="${e.entity_id}">${e.name}（${e.entity_id}）</option>`).join('') +
-    '</optgroup>').join('');
+  const selB = $('sel-brand');
+  if (!PANEL_ENTITIES.length) {
+    selB.innerHTML = '<option value="">HA 实体加载失败（HA 未运行？）</option>';
+    return;
+  }
+  const brands = [...new Set(PANEL_ENTITIES.map(e => e.brand))];
+  brands.sort((a, b) => a.localeCompare(b, 'zh'));
+  selB.innerHTML = '<option value="">— 请选择 —</option>' +
+    brands.map(b => `<option value="${b}">${b}（${PANEL_ENTITIES.filter(e => e.brand === b).length} 条指令）</option>`).join('');
+  selB.disabled = false;
 }
+
+function onBrand() {
+  const b = $('sel-brand').value;
+  const selD = $('sel-device'), selE = $('sel-entity');
+  selE.disabled = true; selE.innerHTML = '<option value="">先选设备</option>';
+  $('opt-wrap').style.display = 'none';
+  $('entity-preview').textContent = '';
+  if (!b) {
+    selD.disabled = true; selD.innerHTML = '<option value="">先选品牌</option>';
+    return;
+  }
+  const devs = [...new Set(PANEL_ENTITIES.filter(e => e.brand === b).map(e => e.device))];
+  devs.sort((a, c) => a.localeCompare(c, 'zh'));
+  selD.innerHTML = '<option value="">— 请选择 —</option>' +
+    devs.map(d => `<option value="${d}">${d}</option>`).join('');
+  selD.disabled = false;
+}
+
+function onDevice() {
+  const b = $('sel-brand').value, dv = $('sel-device').value;
+  const selE = $('sel-entity');
+  $('opt-wrap').style.display = 'none';
+  $('entity-preview').textContent = '';
+  if (!dv) {
+    selE.disabled = true; selE.innerHTML = '<option value="">先选设备</option>';
+    return;
+  }
+  const ents = PANEL_ENTITIES.filter(e => e.brand === b && e.device === dv);
+  ents.sort((a, c) => (a.domain + a.name).localeCompare(c.domain + c.name, 'zh'));
+  selE.innerHTML = '<option value="">— 请选择 —</option>' +
+    ents.map(e => `<option value="${e.entity_id}">${dlabel(e.domain)}｜${e.name}</option>`).join('');
+  selE.disabled = false;
+}
+
 $('sel-entity').onchange = () => {
   const eid = $('sel-entity').value;
   const e = (PANEL_ENTITIES||[]).find(x => x.entity_id === eid);
