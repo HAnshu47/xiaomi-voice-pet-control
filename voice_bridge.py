@@ -168,6 +168,18 @@ def _ha_make_token() -> str:
     return jwt.encode(payload, rt["jwt_key"], algorithm="HS256")
 
 
+_HA_OPENER = None
+
+
+def _ha_open(req, timeout: int = 15):
+    """所有本机 HA 请求都绕过系统代理，否则会被 http_proxy 环境变量劫持。"""
+    global _HA_OPENER
+    from urllib import request as urlrequest
+
+    if _HA_OPENER is None:
+        _HA_OPENER = urlrequest.build_opener(urlrequest.ProxyHandler({}))
+    return _HA_OPENER.open(req, timeout=timeout)
+
 def _ha_token_get() -> str:
     if not _ha_token["value"] or time.time() > _ha_token["exp"]:
         _ha_token["value"] = _ha_make_token()
@@ -187,7 +199,7 @@ def call_ha(action: str, data: dict) -> tuple[int, str]:
                  "Content-Type": "application/json"},
     )
     try:
-        with urlrequest.urlopen(req, timeout=15) as r:
+        with _ha_open(req, 15) as r:
             return r.status, r.read().decode("utf-8", "replace")[:200]
     except urlerror.HTTPError as e:
         return e.code, e.read().decode("utf-8", "replace")[:200]
@@ -235,7 +247,7 @@ def _ha_integration_map() -> dict:
             headers={"Authorization": f"Bearer {_ha_token_get()}",
                      "Content-Type": "application/json"},
         )
-        with urlrequest.urlopen(req, timeout=30) as r:
+        with _ha_open(req, 30) as r:
             _ha_emap["value"] = json.loads(r.read().decode("utf-8", "replace"))
         _ha_emap["exp"] = time.time() + 600
     except Exception as e:  # noqa: BLE001
@@ -254,7 +266,7 @@ def ha_get_states() -> list:
         headers={"Authorization": f"Bearer {_ha_token_get()}"},
     )
     try:
-        with urlrequest.urlopen(req, timeout=15) as r:
+        with _ha_open(req, 15) as r:
             states = json.loads(r.read().decode("utf-8", "replace"))
     except Exception as e:  # noqa: BLE001
         # HA 没启动时会被反复调用，60 秒内只提醒一次，避免刷屏
@@ -295,7 +307,7 @@ def ha_get_states() -> list:
             headers={"Authorization": f"Bearer {_ha_token_get()}",
                      "Content-Type": "application/json"},
         )
-        with urlrequest.urlopen(req2, timeout=20) as r:
+        with _ha_open(req2, 20) as r:
             dmap = json.loads(r.read().decode("utf-8", "replace"))
     except Exception as e:  # noqa: BLE001
         log.warning("拉取设备分组失败(改用扁平模式): %s", e)
@@ -730,7 +742,25 @@ IC_CATALOG = [
      "desc": "大量贴牌智能设备；HA 内置集成，无需安装，直接配置"},
 ]
 
-_IC_STATE = {"state": "idle", "msg": "", "domain": ""}
+_IC_STATE = {"state": "idle", "msg": "", "domain": "", "repo": "", "ts": time.time()}
+_IC_TERMINAL = ("idle", "done", "error")
+
+
+def _ic_set(state: str, msg: str = "", **kw) -> None:
+    """更新安装任务状态并打时间戳（前端据此判断是否卡死）。"""
+    _IC_STATE.update(kw)
+    _IC_STATE.update(state=state, msg=msg, ts=time.time())
+
+
+def _ic_busy() -> bool:
+    """是否已有任务在跑；卡住超过 10 分钟视为失败，允许重试。"""
+    st = _IC_STATE["state"]
+    if st in _IC_TERMINAL:
+        return False
+    if time.time() - _IC_STATE.get("ts", 0) > 600:
+        _ic_set("error", "上次任务超时未结束（已自动解除占用），可以重试")
+        return False
+    return True
 
 
 def _ha_api(method: str, path: str, payload: dict | None = None) -> tuple[int, dict]:
@@ -744,7 +774,7 @@ def _ha_api(method: str, path: str, payload: dict | None = None) -> tuple[int, d
                  "Content-Type": "application/json"},
     )
     try:
-        with urlrequest.urlopen(req, timeout=30) as r:
+        with _ha_open(req, 30) as r:
             raw = r.read().decode("utf-8", "replace")
             return r.status, (json.loads(raw) if raw.strip() else {})
     except urlerror.HTTPError as e:
@@ -771,7 +801,7 @@ def ha_alive() -> bool:
     from urllib import error as urlerror, request as urlrequest
 
     try:
-        with urlrequest.urlopen(f"{HA_BASE}/api/", timeout=3) as r:
+        with _ha_open(f"{HA_BASE}/api/", 3) as r:
             return r.status in (200, 401)
     except urlerror.HTTPError as e:
         return e.code == 401
@@ -814,16 +844,42 @@ def ha_start() -> dict:
     return {"ok": True, "msg": "已启动，约 1~2 分钟就绪"}
 
 
-async def _ic_restart_ha(timeout_s: int = 300) -> None:
-    """重启 HA 并等它回来。"""
+async def _ic_restart_ha(timeout_s: int = 150) -> str:
+    """重启 HA 并等它回来。
+
+    返回 "skipped"（HA 本来没运行，不用重启）/ "ok" / "restarted"（自动拉起成功）。
+    """
     if not ha_alive():
-        await asyncio.sleep(1)
+        log.warning("HA 未运行，跳过重启（启动 HA 后集成即生效）")
+        return "skipped"
+
     call_ha("homeassistant/restart", {})
-    for _ in range(max(1, timeout_s // 5)):
-        await asyncio.sleep(5)
-        if _ha_api("GET", "/api/", None)[0] == 200:
-            return
-    raise ValueError("HA 重启后 5 分钟未恢复，请手动查看 HA 日志")
+    # 先等它真的停下去（否则会把「正在关机」的旧进程误判为已恢复）
+    down = False
+    for _ in range(20):
+        await asyncio.sleep(3)
+        if not ha_alive():
+            down = True
+            break
+    if not down:
+        log.warning("HA 没有进入重启状态（可能重启指令未生效），继续按存活处理")
+
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if ha_alive():
+            return "ok"
+        await asyncio.sleep(3)
+
+    # 重启后没回来：可能是进程直接退出了，尝试自己拉起来
+    log.warning("HA 重启后未恢复，尝试手动启动")
+    ha_start()
+    deadline = time.time() + 180
+    while time.time() < deadline:
+        await asyncio.sleep(3)
+        if ha_alive():
+            return "restarted"
+    raise ValueError("HA 重启后未能恢复（已尝试自动拉起）。"
+                     "请双击 start_ha.bat 或点「启动 Home Assistant」后重试")
 
 
 def _ic_download(url: str) -> bytes:
@@ -893,6 +949,7 @@ def _gh_json(url: str) -> dict | list:
 
     req = urlrequest.Request(url, headers={
         "User-Agent": "voice-bridge", "Accept": "application/vnd.github+json"})
+    # 外网请求保留系统代理（国内直连 GitHub 常不通）
     with urlrequest.urlopen(req, timeout=30) as r:
         return json.loads(r.read().decode("utf-8", "replace"))
 
@@ -969,8 +1026,7 @@ async def ic_install(domain: str = "", repo: str = "") -> None:
     """
     entry = next((e for e in IC_CATALOG if e["domain"] == domain), None) if domain else None
     if entry and entry.get("core"):
-        _IC_STATE.update(state="done", domain=domain,
-                         msg="核心集成无需安装，直接点「配置 / 登录」")
+        _ic_set("done", "核心集成无需安装，直接点「配置 / 登录」", domain=domain)
         return
     if entry:
         zip_url = await asyncio.to_thread(_ic_repo_zip, entry["repo"])
@@ -979,11 +1035,10 @@ async def ic_install(domain: str = "", repo: str = "") -> None:
     else:
         raise ValueError("缺少要安装的集成（domain 或 repo）")
 
-    _IC_STATE.update(state="downloading", domain=domain, repo=repo,
-                     msg=f"正在下载 {repo or domain} …")
+    _ic_set("downloading", f"正在下载 {repo or domain} …", domain=domain, repo=repo)
     data = await asyncio.to_thread(_ic_download, zip_url)
 
-    _IC_STATE.update(state="extracting", msg="正在解压安装…")
+    _ic_set("extracting", "正在解压安装…")
     real_domain, files = _ic_unzip(data)
     if real_domain in ("", ".", "..") or "/" in real_domain:
         raise ValueError(f"集成域名异常: {real_domain!r}")
@@ -995,12 +1050,19 @@ async def ic_install(domain: str = "", repo: str = "") -> None:
         f.write_bytes(content)
     log.info("集成已解压: %s -> %s (%d 个文件)", repo or domain, dest, len(files))
 
-    _IC_STATE.update(state="restarting", domain=real_domain,
-                     msg="安装完成，正在重启 HA（约 1 分钟）…")
-    await _ic_restart_ha()
+    _ic_set("restarting", "安装完成，正在重启 HA（约 1 分钟）…", domain=real_domain)
+    result = await _ic_restart_ha()
 
-    _IC_STATE.update(state="done", domain=real_domain, repo=repo,
-                     msg=f"✅ {real_domain} 安装完成，点「配置 / 登录」接入账号")
+    if result == "skipped":
+        _ic_set("done", f"✅ {real_domain} 已安装。HA 当前没运行，"
+                        "点上面「启动 Home Assistant」后即可配置",
+                domain=real_domain, repo=repo)
+    elif result == "restarted":
+        _ic_set("done", f"✅ {real_domain} 已安装（HA 已自动重新拉起），"
+                        "点「配置 / 登录」接入账号", domain=real_domain, repo=repo)
+    else:
+        _ic_set("done", f"✅ {real_domain} 安装完成，点「配置 / 登录」接入账号",
+                domain=real_domain, repo=repo)
 
 
 async def ic_uninstall(domain: str) -> None:
@@ -1019,7 +1081,7 @@ async def ic_uninstall(domain: str) -> None:
     # 先删掉该域下的配置条目，否则 HA 重启会报「集成未找到」
     removed = 0
     if ha_alive():
-        _IC_STATE.update(state="removing", domain=domain, msg="正在移除配置条目…")
+        _ic_set("removing", "正在移除配置条目…", domain=domain)
         _s, entries = _ha_api("GET", "/api/config/config_entries/entry")
         if isinstance(entries, list):
             for e in entries:
@@ -1028,19 +1090,17 @@ async def ic_uninstall(domain: str) -> None:
                             f"/api/config/config_entries/entry/{e.get('entry_id')}")
                     removed += 1
 
-    _IC_STATE.update(state="removing", domain=domain,
-                     msg=f"正在删除集成文件（已移除 {removed} 个配置条目）…")
+    _ic_set("removing", f"正在删除集成文件（已移除 {removed} 个配置条目）…", domain=domain)
     await asyncio.to_thread(shutil.rmtree, dest, True)
     log.info("已卸载集成: %s (配置条目 %d 个)", domain, removed)
 
-    if ha_alive():
-        _IC_STATE.update(state="restarting", msg="已删除，正在重启 HA…")
-        await _ic_restart_ha()
-        _IC_STATE.update(state="done", domain="",
-                         msg=f"✅ {domain} 已卸载并重启 HA")
+    result = await _ic_restart_ha()
+    if result == "skipped":
+        _ic_set("done", f"✅ {domain} 已删除（HA 未运行，下次启动即生效）", domain="")
+    elif result == "restarted":
+        _ic_set("done", f"✅ {domain} 已卸载（HA 已自动重新拉起）", domain="")
     else:
-        _IC_STATE.update(state="done", domain="",
-                         msg=f"✅ {domain} 已删除（HA 未运行，下次启动即生效）")
+        _ic_set("done", f"✅ {domain} 已卸载并重启 HA", domain="")
 
 
 async def ic_flow_start(handler: str) -> dict:
@@ -1285,6 +1345,9 @@ PANEL_HTML = r"""<!DOCTYPE html>
     <h3>推荐（常用集成，一键安装）</h3>
     <div id="ic-catalog">加载中…</div>
     <div class="msg" id="msg-ic"></div>
+    <div id="ic-stuck" style="display:none; margin-top:6px">
+      <button class="act" onclick="icReset()">任务好像卡住了，强制解除</button>
+    </div>
   </div>
   <div class="card" id="ic-login-card" style="display:none">
     <h3 id="ic-login-title">配置 / 登录</h3>
@@ -1609,8 +1672,8 @@ async function refreshIC() {
       `</div></div>`;
   }).join('');
   if (['downloading', 'extracting', 'restarting', 'removing'].includes(d.state)) {
-    showMsg('msg-ic', d.msg, true);
-    icPollState(true);
+    showMsg('msg-ic', d.msg, true, true);
+    icPollState();
   }
 }
 
@@ -1673,16 +1736,32 @@ async function icInstall(domain, repo) {
   } else showMsg('msg-ic', d.error || '失败', false);
 }
 
-function icPollState(keep) {
-  if (IC_POLL_T) { if (!keep) return; clearInterval(IC_POLL_T); }
+function icPollState() {
+  if (IC_POLL_T) return;              // 只保留一个轮询，重复调用直接忽略
   IC_POLL_T = setInterval(async () => {
-    const d = await jget('/api/ic/state');
-    showMsg('msg-ic', d.msg || d.state, d.state !== 'error');
-    if (['done', 'error', 'idle'].includes(d.state)) {
+    let d;
+    try { d = await jget('/api/ic/state'); } catch (e) { return; }
+    const busy = !['done', 'error', 'idle'].includes(d.state);
+    showMsg('msg-ic', d.msg || d.state, d.state !== 'error', busy);
+    $('ic-stuck').style.display = (busy && d.age > 240) ? '' : 'none';
+    if (!busy) {
       clearInterval(IC_POLL_T); IC_POLL_T = null;
-      if (d.state === 'done') refreshIC();
+      $('ic-stuck').style.display = 'none';
+      const el = $('msg-ic');         // 结束后 6 秒淡出
+      clearTimeout(el._hide);
+      el._hide = setTimeout(() => {
+        el.className = 'msg'; el.dataset.text = ''; el.dataset.ok = '';
+      }, 6000);
+      refreshIC();
     }
-  }, 3000);
+  }, 2000);
+}
+
+async function icReset() {
+  const d = await jpost('/api/ic/reset', {});
+  showMsg('msg-ic', d.ok ? '已解除占用，可以重新操作' : (d.error || '无法重置'), d.ok);
+  $('ic-stuck').style.display = 'none';
+  refreshIC();
 }
 
 async function icFlow(domain) {
@@ -1760,11 +1839,23 @@ async function icSubmit() {
   }
 }
 
-function showMsg(id, text, ok) {
+function showMsg(id, text, ok, sticky) {
   const el = $(id);
+  if (!el) return;
+  // 内容没变就不重绘，否则 2 秒一次轮询会让提示条反复闪烁
+  if (el.dataset.text === text && el.dataset.ok === String(!!ok)) return;
+  el.dataset.text = text;
+  el.dataset.ok = String(!!ok);
   el.className = 'msg ' + (ok ? 'ok' : 'err');
   el.textContent = text;
-  setTimeout(() => { el.className = 'msg'; }, 4000);
+  clearTimeout(el._hide);
+  if (!sticky) {
+    el._hide = setTimeout(() => {
+      el.className = 'msg';
+      el.dataset.text = '';
+      el.dataset.ok = '';
+    }, 4500);
+  }
 }
 
 (async function init() {
@@ -1835,7 +1926,8 @@ class _PanelHandler(BaseHTTPRequestHandler):
                                         "results": []})
             self._send(200, {"ok": True, "results": results})
         elif self.path == "/api/ic/state":
-            self._send(200, dict(_IC_STATE))
+            self._send(200, {**_IC_STATE,
+                             "age": int(time.time() - _IC_STATE.get("ts", 0))})
         elif self.path == "/api/login/state":
             self._send(200, {"state": _login_state["state"],
                              "msg": _login_state["msg"]})
@@ -1882,14 +1974,13 @@ class _PanelHandler(BaseHTTPRequestHandler):
             log.info("面板手动执行 %s -> HTTP %s", cmd.get("script") or cmd.get("service"), code)
             self._send(200, {"code": code, "body": resp[:120]})
         elif self.path == "/api/ic/install":
-            if _IC_STATE["state"] not in ("idle", "done", "error"):
+            if _ic_busy():
                 return self._send(400, {"ok": False, "error": "已有任务在进行"})
             domain = str(body.get("domain", "") or "")
             repo = str(body.get("repo", "") or "")
             if not domain and not repo:
                 return self._send(400, {"ok": False, "error": "缺少 domain 或 repo"})
-            _IC_STATE.update(state="downloading", msg="准备下载…",
-                             domain=domain, repo=repo)
+            _ic_set("downloading", "准备下载…", domain=domain, repo=repo)
             fut = asyncio.run_coroutine_threadsafe(
                 ic_install(domain, repo), _LOOP)
             # 只报启动成功与否，过程走 /api/ic/state 轮询
@@ -1897,27 +1988,36 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 try:
                     f.result()
                 except Exception as e:  # noqa: BLE001
-                    _IC_STATE.update(state="error", msg=str(e)[:300])
+                    _ic_set("error", str(e)[:300])
                     log.warning("集成安装失败: %s", e)
             fut.add_done_callback(_on_done)
             self._send(200, {"ok": True, "state": "started"})
         elif self.path == "/api/ic/uninstall":
-            if _IC_STATE["state"] not in ("idle", "done", "error"):
+            if _ic_busy():
                 return self._send(400, {"ok": False, "error": "已有任务在进行"})
             domain = str(body.get("domain", "") or "").strip()
             if not domain:
                 return self._send(400, {"ok": False, "error": "缺少 domain"})
-            _IC_STATE.update(state="removing", domain=domain, msg="准备卸载…")
+            _ic_set("removing", "准备卸载…", domain=domain)
             fut = asyncio.run_coroutine_threadsafe(ic_uninstall(domain), _LOOP)
 
             def _on_done2(f):
                 try:
                     f.result()
                 except Exception as e:  # noqa: BLE001
-                    _IC_STATE.update(state="error", msg=str(e)[:300])
+                    _ic_set("error", str(e)[:300])
                     log.warning("卸载失败: %s", e)
             fut.add_done_callback(_on_done2)
             self._send(200, {"ok": True, "state": "started"})
+        elif self.path == "/api/ic/reset":
+            age = time.time() - _IC_STATE.get("ts", 0)
+            if _IC_STATE["state"] in _IC_TERMINAL or age > 240:
+                _ic_set("error", "已手动解除占用（原任务可能仍在后台跑完）",
+                        domain="", repo="")
+                self._send(200, {"ok": True})
+            else:
+                self._send(200, {"ok": False,
+                                 "error": f"任务才开始 {int(age)} 秒，再等一会儿"})
         elif self.path == "/api/ha/start":
             self._send(200, ha_start())
         elif self.path == "/api/ic/flow":
