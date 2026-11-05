@@ -705,6 +705,136 @@ async def _panel_submit_otp(code: str) -> dict:
     raise ValueError(_login_state["msg"] or "登录失败")
 
 
+# ---------------------------------------------------------------------------
+# 集成中心：面板内安装品牌集成（驱动）+ 代理 HA 配置/登录流程
+# ---------------------------------------------------------------------------
+HA_CONFIG_DIR = BASE_DIR / "homeassistant"
+
+IC_CATALOG = [
+    {"domain": "petkit", "name": "小佩 PetKit",
+     "repo": "https://github.com/RobertD501/ha-petkit",
+     "zip_url": "https://github.com/RobertD501/ha-petkit/archive/refs/heads/main.zip",
+     "login": "password",
+     "desc": "猫砂盆/喂食器/饮水机等小佩设备，账号密码登录"},
+    {"domain": "xiaomi_miot", "name": "小米米家 xiaomi_miot",
+     "repo": "https://github.com/al-one/hass-xiaomi-miot",
+     "zip_url": "https://github.com/al-one/hass-xiaomi-miot/archive/refs/heads/master.zip",
+     "login": "password",
+     "desc": "小米账号密码登录，米家设备覆盖广（你现有小米设备即此方案可替换）"},
+    {"domain": "xiaomi_home", "name": "小米官方 ha_xiaomi_home",
+     "repo": "https://github.com/XiaoMi/ha_xiaomi_home",
+     "zip_url": "https://github.com/XiaoMi/ha_xiaomi_home/archive/refs/heads/main.zip",
+     "login": "oauth",
+     "desc": "小米官方维护；登录需跳转小米授权页一次（OAuth）"},
+    {"domain": "tuya", "name": "涂鸦 Tuya", "core": True,
+     "login": "oauth",
+     "desc": "大量贴牌智能设备；需涂鸦开发者账号，OAuth 授权，无需安装"},
+]
+
+_IC_STATE = {"state": "idle", "msg": "", "domain": ""}
+
+
+def _ha_api(method: str, path: str, payload: dict | None = None) -> tuple[int, dict]:
+    """调 HA REST API，返回 (http状态码, 解析后的JSON)。不抛异常。"""
+    from urllib import error as urlerror, request as urlrequest
+
+    req = urlrequest.Request(
+        f"{HA_BASE}{path}", method=method,
+        data=json.dumps(payload).encode() if payload is not None else None,
+        headers={"Authorization": f"Bearer {_ha_token_get()}",
+                 "Content-Type": "application/json"},
+    )
+    try:
+        with urlrequest.urlopen(req, timeout=30) as r:
+            raw = r.read().decode("utf-8", "replace")
+            return r.status, (json.loads(raw) if raw.strip() else {})
+    except urlerror.HTTPError as e:
+        raw = e.read().decode("utf-8", "replace")
+        try:
+            return e.code, json.loads(raw) if raw.strip() else {}
+        except json.JSONDecodeError:
+            return e.code, {"message": raw[:200]}
+    except Exception as e:  # noqa: BLE001
+        return 0, {"message": f"{type(e).__name__}: {e}"}
+
+
+def _ic_download(url: str) -> bytes:
+    """下载集成压缩包；GitHub 直连失败时自动尝试镜像加速。"""
+    last = None
+    mirrors = (url, "https://ghfast.top/" + url, "https://ghproxy.net/" + url)
+    from urllib import request as urlrequest
+    for u in mirrors:
+        try:
+            req = urlrequest.Request(u, headers={"User-Agent": "Mozilla/5.0"})
+            with urlrequest.urlopen(req, timeout=180) as r:
+                data = r.read()
+            if len(data) > 10_000:      # 镜像失败时可能返回错误页，按大小区分
+                return data
+            last = RuntimeError(f"响应过小({len(data)}B)")
+        except Exception as e:  # noqa: BLE001
+            last = e
+    raise ValueError(f"下载失败: {last}")
+
+
+async def ic_install(domain: str) -> None:
+    """安装任务：下载 -> 解压到 custom_components -> 重启 HA -> 等恢复。"""
+    import io
+    import zipfile
+
+    entry = next((e for e in IC_CATALOG if e["domain"] == domain), None)
+    if not entry:
+        raise ValueError("清单里没有这个集成")
+    if entry.get("core"):
+        _IC_STATE.update(state="done", domain=domain,
+                         msg="核心集成无需安装，直接点「配置 / 登录」")
+        return
+
+    _IC_STATE.update(state="downloading", domain=domain, msg="正在下载集成…")
+    data = await asyncio.to_thread(_ic_download, entry["zip_url"])
+
+    _IC_STATE.update(state="extracting", msg="正在解压安装…")
+    prefix = f"custom_components/{domain}/"
+    dest = HA_CONFIG_DIR / "custom_components" / domain
+    zin = zipfile.ZipFile(io.BytesIO(data))
+    members = [n for n in zin.namelist()
+               if prefix in n and not n.endswith("/")]
+    if not members:
+        raise ValueError("压缩包里没找到集成目录，可能仓库结构已变化")
+    cut = members[0].split(prefix)[0] + prefix
+    dest.mkdir(parents=True, exist_ok=True)
+    for n in members:
+        rel = n[len(cut):]
+        (dest / rel).parent.mkdir(parents=True, exist_ok=True)
+        (dest / rel).write_bytes(zin.read(n))
+
+    _IC_STATE.update(state="restarting", msg="安装完成，正在重启 HA（约 1 分钟）…")
+    call_ha("homeassistant/restart", {})
+    for _ in range(60):
+        await asyncio.sleep(5)
+        code, _d = _ha_api("GET", "/api/")
+        if code == 200:
+            break
+    else:
+        raise ValueError("HA 重启后 5 分钟未恢复，请手动查看 HA 日志")
+
+    _IC_STATE.update(state="done", domain=domain,
+                     msg="✅ 安装完成，点「配置 / 登录」接入你的账号")
+
+
+async def ic_flow_start(handler: str) -> dict:
+    """发起 HA 配置流程（登录），返回第一步表单定义。"""
+    status, data = _ha_api("POST", "/api/config/config_entries/flow",
+                           {"handler": handler})
+    return {"status": status, **data}
+
+
+async def ic_flow_submit(flow_id: str, fields: dict) -> dict:
+    """提交配置流程当前步骤，返回下一步/成功/中止。"""
+    status, data = _ha_api("POST", f"/api/config/config_entries/flow/{flow_id}",
+                           fields)
+    return {"status": status, **data}
+
+
 async def runtime_logout() -> None:
     """面板退出登录：停监听、删令牌、清状态。"""
     s = _session
@@ -783,6 +913,7 @@ PANEL_HTML = r"""<!DOCTYPE html>
   <button data-tab="test">测试</button>
   <button data-tab="log">日志</button>
   <button data-tab="acct">账号</button>
+  <button data-tab="ic">集成中心</button>
 </nav>
 <main>
 
@@ -896,6 +1027,25 @@ PANEL_HTML = r"""<!DOCTYPE html>
     </details>
   </div>
 </div>
+<div id="tab-ic" class="tab" style="display:none">
+  <div class="card">
+    <h3>我的集成</h3>
+    <div id="ic-installed">加载中…</div>
+  </div>
+  <div class="card">
+    <h3>添加品牌（自动下载驱动 → 重启 HA → 面板内登录）</h3>
+    <div id="ic-catalog">加载中…</div>
+    <div class="msg" id="msg-ic"></div>
+  </div>
+  <div class="card" id="ic-login-card" style="display:none">
+    <h3 id="ic-login-title">配置 / 登录</h3>
+    <div id="ic-form"></div>
+    <div class="row" style="margin-top:10px">
+      <button class="pri" onclick="icSubmit()">提交</button>
+    </div>
+    <div class="msg" id="msg-ic-flow"></div>
+  </div>
+</div>
 
 </main>
 <script>
@@ -911,6 +1061,7 @@ document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
   if (b.dataset.tab === 'log') refreshLog();
   if (b.dataset.tab === 'list') refreshCmds();
   if (b.dataset.tab === 'acct') refreshAcct();
+  if (b.dataset.tab === 'ic') refreshIC();
 });
 
 async function jget(url) { const r = await fetch(url); return r.json(); }
@@ -1181,6 +1332,131 @@ async function doLogout() {
   refreshAcct();
 }
 
+/* ---------- 集成中心 ---------- */
+let IC_FLOW = null;
+let IC_POLL_T = null;
+
+async function refreshIC() {
+  const d = await jget('/api/ic/list');
+  $('ic-installed').innerHTML = d.installed.length
+    ? '<table><tr><th>集成</th><th>版本</th></tr>' +
+      d.installed.map(i => `<tr><td>${i.name}（${i.domain}）</td><td>${i.version || '-'}</td></tr>`).join('') +
+      '</table>'
+    : '<p class="hint">还没有自定义集成</p>';
+  $('ic-catalog').innerHTML = d.catalog.map(e => {
+    const badge = e.login === 'password'
+      ? '<span class="kw">账密登录</span>' : '<span class="kw">OAuth 授权</span>';
+    const btn = e.installed
+      ? `<button class="act" onclick="icFlow('${e.domain}')">配置 / 登录</button>`
+      : `<button class="pri" onclick="icInstall('${e.domain}')">安装</button>`;
+    return `<div style="border:1px solid #e5e5e5;border-radius:8px;padding:10px;margin:8px 0">` +
+      `<b>${e.name}</b> ${badge}<br>` +
+      `<span class="hint">${e.desc || ''}</span>` +
+      `<div class="row" style="margin-top:6px">${btn}` +
+      (e.repo ? ` <a class="hint" href="${e.repo}" target="_blank">源码</a>` : '') +
+      `</div></div>`;
+  }).join('');
+  if (['downloading', 'extracting', 'restarting'].includes(d.state)) {
+    showMsg('msg-ic', d.msg, true);
+    icPollState(true);
+  }
+}
+
+async function icInstall(domain) {
+  const d = await jpost('/api/ic/install', {domain});
+  if (d.ok) {
+    showMsg('msg-ic', '安装任务已开始：下载 → 自动重启 HA → 等待恢复（约 1 分钟）', true);
+    icPollState();
+  } else showMsg('msg-ic', d.error || '失败', false);
+}
+
+function icPollState(keep) {
+  if (IC_POLL_T) { if (!keep) return; clearInterval(IC_POLL_T); }
+  IC_POLL_T = setInterval(async () => {
+    const d = await jget('/api/ic/state');
+    showMsg('msg-ic', d.msg || d.state, d.state !== 'error');
+    if (['done', 'error', 'idle'].includes(d.state)) {
+      clearInterval(IC_POLL_T); IC_POLL_T = null;
+      if (d.state === 'done') refreshIC();
+    }
+  }, 3000);
+}
+
+async function icFlow(domain) {
+  const d = await jpost('/api/ic/flow', {handler: domain});
+  IC_FLOW = d;
+  if (d.type === 'form') icRenderForm(d);
+  else if (d.type === 'external') {
+    $('ic-login-card').style.display = '';
+    $('ic-form').innerHTML =
+      `<p>该品牌需要 OAuth 授权，请在 HA 网页完成一次：</p>` +
+      `<p><a href="http://127.0.0.1:8123/config/integrations" target="_blank">点此打开 HA 集成页</a></p>` +
+      `<p class="hint">${(d.description_placeholders || {}).url || ''}</p>`;
+    $('msg-ic-flow').className = 'msg';
+  } else if (d.type === 'abort') {
+    showMsg('msg-ic-flow', '配置中止：' + (d.reason || '未知原因'), false);
+  } else showMsg('msg-ic-flow', '异常响应：' + JSON.stringify(d).slice(0, 150), false);
+}
+
+function icRenderForm(step) {
+  $('ic-login-card').style.display = '';
+  $('ic-login-title').textContent = '配置 / 登录：' + (step.title || IC_FLOW.handler || '');
+  const ph = step.description_placeholders || {};
+  const schema = step.data_schema || [];
+  $('ic-form').innerHTML = schema.map(([key, sch]) => {
+    const label = ph[key] || key;
+    const val = sch.default != null ? sch.default : '';
+    if (sch.type === 'boolean') {
+      return `<label>${label}</label><select id="f_${key}">` +
+        `<option value="true" ${val ? 'selected' : ''}>开</option>` +
+        `<option value="false" ${val === false ? 'selected' : ''}>关</option></select>`;
+    }
+    if (sch.type === 'select') {
+      return `<label>${label}</label><select id="f_${key}">` +
+        (sch.options || []).map(o => {
+          const [ov, ol] = Array.isArray(o) ? o : [o, o];
+          return `<option value="${ov}" ${ov === val ? 'selected' : ''}>${ol}</option>`;
+        }).join('') + '</select>';
+    }
+    if (sch.type === 'integer' || sch.type === 'float') {
+      return `<label>${label}</label><input type="number" id="f_${key}" value="${val}">`;
+    }
+    const isSecret = /pass|pwd|token|secret|key/i.test(key);
+    return `<label>${label}</label><input type="${isSecret ? 'password' : 'text'}" id="f_${key}" value="${val}">`;
+  }).join('') || '<p class="hint">本步骤无需填写，直接提交</p>';
+  $('msg-ic-flow').className = 'msg';
+}
+
+async function icSubmit() {
+  if (!IC_FLOW || !IC_FLOW.flow_id) return showMsg('msg-ic-flow', '没有进行中的配置', false);
+  const fields = {};
+  $('ic-form').querySelectorAll('[id^="f_"]').forEach(el => {
+    const k = el.id.slice(2);
+    let v = el.value;
+    if (el.tagName === 'SELECT' && (v === 'true' || v === 'false')) v = v === 'true';
+    else if (el.type === 'number') v = Number(v);
+    fields[k] = v;
+  });
+  const d = await jpost('/api/ic/flow_submit', {flow_id: IC_FLOW.flow_id, fields});
+  IC_FLOW = d;
+  if (d.type === 'form') {
+    icRenderForm(d);
+    showMsg('msg-ic-flow', '本步已通过，继续填写', true);
+  } else if (d.type === 'create_entry') {
+    showMsg('msg-ic-flow', '✅ 配置成功！设备已接入，去「添加口令」页选它', true);
+    $('ic-login-card').style.display = 'none';
+    PANEL_ENTITIES = (await jget('/api/ha/entities')).entities || [];
+    loadEntities();
+  } else if (d.type === 'external') {
+    $('ic-form').innerHTML =
+      '<p>需要 OAuth 授权，请打开 <a href="http://127.0.0.1:8123/config/integrations" target="_blank">HA 集成页</a> 完成授权</p>';
+  } else if (d.type === 'abort') {
+    showMsg('msg-ic-flow', '配置中止：' + (d.reason || '未知原因') + '（可能是账号已配置过）', false);
+  } else {
+    showMsg('msg-ic-flow', '错误：' + JSON.stringify(d.errors || d).slice(0, 150), false);
+  }
+}
+
 function showMsg(id, text, ok) {
   const el = $(id);
   el.className = 'msg ' + (ok ? 'ok' : 'err');
@@ -1223,6 +1499,27 @@ class _PanelHandler(BaseHTTPRequestHandler):
             self._send(200, {"lines": list(_ring.buf)})
         elif self.path == "/api/ha/entities":
             self._send(200, {"entities": ha_get_states()})
+        elif self.path == "/api/ic/list":
+            installed = []
+            cc = HA_CONFIG_DIR / "custom_components"
+            if cc.is_dir():
+                for d in sorted(cc.iterdir()):
+                    mf = d / "manifest.json"
+                    if d.is_dir() and mf.is_file():
+                        try:
+                            m = json.loads(mf.read_text(encoding="utf-8"))
+                        except Exception:  # noqa: BLE001
+                            m = {}
+                        installed.append({"domain": d.name,
+                                          "name": m.get("name", d.name),
+                                          "version": m.get("version", "")})
+            domains = {i["domain"] for i in installed}
+            catalog = [dict(e, installed=e["domain"] in domains or bool(e.get("core")))
+                       for e in IC_CATALOG]
+            self._send(200, {"installed": installed, "catalog": catalog,
+                             "state": _IC_STATE["state"], "msg": _IC_STATE["msg"]})
+        elif self.path == "/api/ic/state":
+            self._send(200, dict(_IC_STATE))
         elif self.path == "/api/login/state":
             self._send(200, {"state": _login_state["state"],
                              "msg": _login_state["msg"]})
@@ -1267,6 +1564,31 @@ class _PanelHandler(BaseHTTPRequestHandler):
             code, resp = exec_command(cmd)
             log.info("面板手动执行 %s -> HTTP %s", cmd.get("script") or cmd.get("service"), code)
             self._send(200, {"code": code, "body": resp[:120]})
+        elif self.path == "/api/ic/install":
+            if _IC_STATE["state"] not in ("idle", "done", "error"):
+                return self._send(400, {"ok": False, "error": "已有安装任务在进行"})
+            _IC_STATE.update(state="downloading", msg="准备下载…",
+                             domain=str(body.get("domain", "")))
+            fut = asyncio.run_coroutine_threadsafe(
+                ic_install(str(body.get("domain", ""))), _LOOP)
+            # 只报启动成功与否，过程走 /api/ic/state 轮询
+            def _on_done(f):
+                try:
+                    f.result()
+                except Exception as e:  # noqa: BLE001
+                    _IC_STATE.update(state="error", msg=str(e)[:300])
+                    log.warning("集成安装失败: %s", e)
+            fut.add_done_callback(_on_done)
+            self._send(200, {"ok": True, "state": "started"})
+        elif self.path == "/api/ic/flow":
+            status, data = _ha_api("POST", "/api/config/config_entries/flow",
+                                   {"handler": str(body.get("handler", ""))})
+            self._send(200, {"status": status, **data})
+        elif self.path == "/api/ic/flow_submit":
+            status, data = _ha_api(
+                "POST", f"/api/config/config_entries/flow/{body.get('flow_id', '')}",
+                dict(body.get("fields") or {}))
+            self._send(200, {"status": status, **data})
         elif self.path in ("/api/login", "/api/login/otp", "/api/logout") and _LOOP is not None:
             # 登录/登出需要在主事件循环里跑（miservice 是异步的）
             if self.path == "/api/logout":
