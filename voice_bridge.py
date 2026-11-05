@@ -347,12 +347,17 @@ async def _login_via_passtoken(account) -> bool:
         return False
 
 
-async def build_session(use_password: bool = False) -> tuple:
+class _NoLogin(Exception):
+    """无可用令牌且不允许交互登录（--run 交给面板登录接管）。"""
+
+
+async def build_session(use_password: bool = False, interactive: bool = True) -> tuple:
     """返回 (account, cookie_dict, hardware, device_id, speaker_name)。
 
     登录优先级：
     1. 已保存的令牌（.mi.token，含 passToken，可免密续登录）
-    2. 浏览器 passToken 辅助（不需要密码）
+    2. 浏览器 passToken 辅助（不需要密码；interactive=False 时不问，
+       抛 _NoLogin，由面板登录接管）
     3. 账号+密码登录（仅 --password 时才问，且易触发小米风控）
     """
     from miservice import MiAccount, MiNAService
@@ -383,6 +388,8 @@ async def build_session(use_password: bool = False) -> tuple:
 
     # 2) 没有可用令牌且未指定 --password → 浏览器 passToken 辅助
     if not _logged_in(account) and not use_password:
+        if not interactive:
+            raise _NoLogin()
         print("\n" + "=" * 60)
         print("需要浏览器辅助登录一次（不需要输入密码）：")
         print("1. 用浏览器打开 https://account.xiaomi.com 并登录同一个账号")
@@ -580,8 +587,10 @@ _LOOP: "asyncio.AbstractEventLoop | None" = None   # 主事件循环（面板线
 
 
 def _start_poll_task(probe_seconds: float = 0) -> "asyncio.Task":
-    """启动（或复用）轮询任务。"""
+    """启动（或复用）轮询任务。未登录时不启动（登录成功后会自动调）。"""
     s = _session
+    if not s["cookie"]:
+        return None
     if s["poll_task"] and not s["poll_task"].done():
         return s["poll_task"]
     s["poll_task"] = asyncio.create_task(
@@ -624,6 +633,76 @@ async def runtime_login(pass_token: str, user_id: str) -> dict:
     log.info("面板登录成功，使用音箱：%s (%s)", s["name"], s["hardware"])
     _start_poll_task()
     return {"name": s["name"], "hardware": s["hardware"]}
+
+
+# 面板密码登录的状态机：idle -> sending -> otp_required -> ok / error
+_login_state = {"state": "idle", "msg": "", "otp_future": None}
+
+
+async def _panel_otp_callback(otp_method: str) -> str:
+    """miservice 登录验证码回调：等面板提交验证码（5 分钟超时）。"""
+    fut = asyncio.get_running_loop().create_future()
+    _login_state["otp_future"] = fut
+    _login_state["state"] = "otp_required"
+    where = "邮箱" if otp_method == "Email" else "手机短信"
+    _login_state["msg"] = f"验证码已发送到{where}，请在面板输入"
+    log.info("登录需要验证码（%s），请在面板输入", otp_method)
+    try:
+        return str(await asyncio.wait_for(fut, timeout=300)).strip()
+    except asyncio.TimeoutError:
+        raise Exception("验证码等待超时（5 分钟），请重新登录")
+    finally:
+        _login_state["otp_future"] = None
+
+
+async def runtime_login_password(user: str, pwd: str) -> None:
+    """面板密码登录（后台任务）。过程与结果写入 _login_state。"""
+    from miservice import MiAccount, MiNAService
+
+    _login_state.update({"state": "sending", "msg": "正在登录…", "otp_future": None})
+    try:
+        account = MiAccount(None, user.strip(), pwd, token_store=TOKEN_PATH,
+                            otp_callback=_panel_otp_callback)
+        if not await account.login("micoapi"):
+            raise ValueError(f"密码登录失败：{account._login_error}"
+                             "（若提示「非法请求」10012，是小米风控，等 1~2 小时再试）")
+        lst = (await MiNAService(account).device_list()) or []
+        if not lst:
+            raise ValueError("登录成功，但账号下没有小爱音箱")
+        chosen = next((d for d in lst if SPEAKER and SPEAKER in
+                       (d.get("name"), d.get("deviceID"))), lst[0])
+        s = _session
+        s["account"] = account
+        s["cookie"] = {"userId": account.token["userId"],
+                       "serviceToken": account.token["micoapi"][1],
+                       "deviceId": chosen.get("deviceID")}
+        s["hardware"] = chosen.get("hardware", "")
+        s["id"] = chosen.get("deviceID", "")
+        s["name"] = chosen.get("name", "")
+        _speaker_info.update({"name": s["name"], "hardware": s["hardware"], "id": s["id"]})
+        _login_state["state"] = "ok"
+        _login_state["msg"] = s["name"]
+        log.info("面板密码登录成功，使用音箱：%s (%s)", s["name"], s["hardware"])
+        _start_poll_task()
+    except Exception as e:  # noqa: BLE001
+        _login_state["state"] = "error"
+        _login_state["msg"] = str(e)[:300]
+        log.warning("面板密码登录失败: %s", e)
+
+
+async def _panel_submit_otp(code: str) -> dict:
+    """面板提交验证码：喂给等待中的登录任务并等它收尾。"""
+    fut = _login_state.get("otp_future")
+    if not fut or fut.done():
+        raise ValueError("当前没有等待验证码的登录流程")
+    if not code.strip():
+        raise ValueError("验证码不能为空")
+    fut.set_result(code)
+    while _login_state["state"] in ("sending", "otp_required"):
+        await asyncio.sleep(0.5)
+    if _login_state["state"] == "ok":
+        return {"name": _session["name"], "hardware": _session["hardware"]}
+    raise ValueError(_login_state["msg"] or "登录失败")
 
 
 async def runtime_logout() -> None:
@@ -784,21 +863,37 @@ PANEL_HTML = r"""<!DOCTYPE html>
     </div>
   </div>
   <div class="card" id="login-card">
-    <h3>登录（浏览器 passToken 免密方式）</h3>
-    <div class="hint">
-      1. 浏览器打开 <b>account.xiaomi.com</b> 并登录同一个账号<br>
-      2. 按 F12 → Application(应用) → Cookies → https://account.xiaomi.com<br>
-      3. 复制 <b>passToken</b>（长字符串）和 <b>userId</b>（纯数字）粘贴到下面
-    </div>
-    <label>passToken</label>
-    <textarea id="in-pt" rows="3" style="width:100%; box-sizing:border-box; font-size:12px"
-              placeholder="V1:xxxxxxxx…"></textarea>
-    <label>userId（纯数字）</label>
-    <input type="text" id="in-uid" placeholder="例如 1234567890">
+    <h3>登录小米账号</h3>
+    <label>小米账号（手机号/邮箱）</label>
+    <input type="text" id="in-user" placeholder="手机号或邮箱">
+    <label>密码</label>
+    <input type="password" id="in-pwd" placeholder="小米账号密码">
     <div class="row" style="margin-top:10px">
-      <button class="pri" onclick="doLogin()">登录</button>
+      <button class="pri" onclick="doPwdLogin()">登录</button>
+    </div>
+    <div id="otp-row" style="display:none">
+      <label>短信验证码（已发送到手机）</label>
+      <div class="row">
+        <input type="text" id="in-otp" style="max-width:160px" placeholder="6 位数字">
+        <button class="pri" onclick="doOtp()">提交验证码</button>
+      </div>
     </div>
     <div class="msg" id="msg-acct"></div>
+    <details style="margin-top:12px">
+      <summary class="hint" style="cursor:pointer">passToken 方式登录（备用，不需要密码）</summary>
+      <div class="hint" style="margin-top:6px">
+        1. 浏览器打开 <b>account.xiaomi.com</b> 并登录 → 2. F12 → Application → Cookies
+        → https://account.xiaomi.com → 3. 复制 <b>passToken</b> 和 <b>userId</b>
+      </div>
+      <label>passToken</label>
+      <textarea id="in-pt" rows="3" style="width:100%; box-sizing:border-box; font-size:12px"
+                placeholder="V1:xxxxxxxx…"></textarea>
+      <label>userId（纯数字）</label>
+      <input type="text" id="in-uid" placeholder="例如 1234567890">
+      <div class="row" style="margin-top:8px">
+        <button class="act" onclick="doLogin()">用 passToken 登录</button>
+      </div>
+    </details>
   </div>
 </div>
 
@@ -1022,6 +1117,52 @@ async function refreshAcct() {
     : '未登录——登录后开始监听';
 }
 
+let LOGIN_POLL = null;
+
+function startLoginPoll() {
+  if (LOGIN_POLL) clearInterval(LOGIN_POLL);
+  LOGIN_POLL = setInterval(async () => {
+    const d = await jget('/api/login/state');
+    if (d.state === 'otp_required') {
+      $('otp-row').style.display = '';
+      showMsg('msg-acct', d.msg || '验证码已发送，请输入', true);
+    } else if (d.state === 'sending') {
+      showMsg('msg-acct', d.msg || '正在登录…', true);
+    } else if (d.state === 'ok') {
+      clearInterval(LOGIN_POLL); LOGIN_POLL = null;
+      showMsg('msg-acct', '登录成功：' + d.msg, true);
+      refreshAcct();
+    } else if (d.state === 'error') {
+      clearInterval(LOGIN_POLL); LOGIN_POLL = null;
+      $('otp-row').style.display = 'none';
+      showMsg('msg-acct', d.msg || '登录失败', false);
+    }
+  }, 2000);
+}
+
+async function doPwdLogin() {
+  const user = $('in-user').value.trim(), pwd = $('in-pwd').value;
+  if (!user || !pwd) return showMsg('msg-acct', '请填写账号和密码', false);
+  const d = await jpost('/api/login', {user, pwd});
+  if (d.ok) startLoginPoll();
+  else showMsg('msg-acct', d.error || '登录请求失败', false);
+}
+
+async function doOtp() {
+  const code = $('in-otp').value.trim();
+  if (!code) return showMsg('msg-acct', '请输入验证码', false);
+  const d = await jpost('/api/login/otp', {code});
+  if (d.ok) {
+    showMsg('msg-acct', '验证通过，登录成功：' + (d.name || ''), true);
+    $('otp-row').style.display = 'none';
+    $('in-user').value = ''; $('in-pwd').value = ''; $('in-otp').value = '';
+    if (LOGIN_POLL) { clearInterval(LOGIN_POLL); LOGIN_POLL = null; }
+    refreshAcct();
+  } else {
+    showMsg('msg-acct', d.error || '验证失败', false);
+  }
+}
+
 async function doLogin() {
   const d = await jpost('/api/login', {passToken: $('in-pt').value, userId: $('in-uid').value});
   if (d.ok) {
@@ -1082,6 +1223,9 @@ class _PanelHandler(BaseHTTPRequestHandler):
             self._send(200, {"lines": list(_ring.buf)})
         elif self.path == "/api/ha/entities":
             self._send(200, {"entities": ha_get_states()})
+        elif self.path == "/api/login/state":
+            self._send(200, {"state": _login_state["state"],
+                             "msg": _login_state["msg"]})
         elif self.path == "/api/status":
             self._send(200, {"speaker": _speaker_info["name"] or "未知",
                              "hardware": _speaker_info["hardware"] or "?",
@@ -1123,10 +1267,23 @@ class _PanelHandler(BaseHTTPRequestHandler):
             code, resp = exec_command(cmd)
             log.info("面板手动执行 %s -> HTTP %s", cmd.get("script") or cmd.get("service"), code)
             self._send(200, {"code": code, "body": resp[:120]})
-        elif self.path in ("/api/login", "/api/logout") and _LOOP is not None:
+        elif self.path in ("/api/login", "/api/login/otp", "/api/logout") and _LOOP is not None:
             # 登录/登出需要在主事件循环里跑（miservice 是异步的）
-            coro = runtime_login(body.get("passToken", ""), body.get("userId", "")) \
-                if self.path == "/api/login" else runtime_logout()
+            if self.path == "/api/logout":
+                coro = runtime_logout()
+            elif self.path == "/api/login/otp":
+                coro = _panel_submit_otp(str(body.get("code", "")))
+            elif body.get("passToken"):
+                coro = runtime_login(body.get("passToken", ""), body.get("userId", ""))
+            elif body.get("user") and body.get("pwd"):
+                if _login_state["state"] not in ("idle", "ok", "error"):
+                    return self._send(200, {"ok": True, "state": _login_state["state"]})
+                coro = runtime_login_password(body["user"], body["pwd"])
+                asyncio.run_coroutine_threadsafe(coro, _LOOP)
+                return self._send(200, {"ok": True, "state": "started"})
+            else:
+                return self._send(400, {"ok": False,
+                                        "error": "缺少 passToken 或 user/pwd"})
             fut = asyncio.run_coroutine_threadsafe(coro, _LOOP)
             try:
                 result = fut.result(timeout=90)
@@ -1171,24 +1328,34 @@ async def main_async() -> None:
         ap.print_help()
         return
 
-    account, cookie, hardware, device_id, name = await build_session(args.password)
-    _session.update({"account": account, "cookie": cookie, "hardware": hardware,
-                     "id": device_id, "name": name})
+    try:
+        account, cookie, hardware, device_id, name = await build_session(
+            args.password, interactive=not args.run)
+        _session.update({"account": account, "cookie": cookie, "hardware": hardware,
+                         "id": device_id, "name": name})
+    except _NoLogin:
+        log.warning("没有已保存的登录令牌——监听暂不启动，"
+                    "请打开管理面板「账号」页登录")
     _LOOP = asyncio.get_running_loop()
     start_panel()
 
     if args.devices:
+        if not _session["account"]:
+            raise SystemExit("未登录，无法列出设备；先执行 --login")
         from miservice import MiNAService
-        for d in (await MiNAService(account).device_list()) or []:
+        for d in (await MiNAService(_session["account"]).device_list()) or []:
             log.info("音箱: name=%s hardware=%s deviceID=%s", d.get("name"),
                      d.get("hardware"), d.get("deviceID"))
         return
 
     if args.probe:
-        await poll_loop(hardware, cookie, probe_seconds=args.probe)
+        if not _session["cookie"]:
+            raise SystemExit("未登录，probe 不可用；先执行 --login 或面板登录")
+        await poll_loop(_session["hardware"], _session["cookie"],
+                        probe_seconds=args.probe)
         return
 
-    _start_poll_task()
+    _start_poll_task()      # 未登录时 _start_poll_task 内部 no-op 由登录触发
     await asyncio.Event().wait()   # 常驻；面板可随时退出/重登录并重启监听
 
 
