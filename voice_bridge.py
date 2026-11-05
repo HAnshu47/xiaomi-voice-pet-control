@@ -574,6 +574,77 @@ async def poll_loop(hardware: str, cookie: dict, probe_seconds: float = 0) -> No
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 _speaker_info = {"name": "", "hardware": "", "id": ""}
+_session = {"account": None, "cookie": {}, "hardware": "", "id": "", "name": "",
+            "poll_task": None}
+_LOOP: "asyncio.AbstractEventLoop | None" = None   # 主事件循环（面板线程回调用）
+
+
+def _start_poll_task(probe_seconds: float = 0) -> "asyncio.Task":
+    """启动（或复用）轮询任务。"""
+    s = _session
+    if s["poll_task"] and not s["poll_task"].done():
+        return s["poll_task"]
+    s["poll_task"] = asyncio.create_task(
+        poll_loop(s["hardware"], s["cookie"], probe_seconds))
+    return s["poll_task"]
+
+
+async def runtime_login(pass_token: str, user_id: str) -> dict:
+    """面板登录：浏览器 passToken -> 建立运行时 session。
+
+    失败抛 ValueError（原因已写进日志）。
+    """
+    from miservice import MiAccount, MiNAService
+    from miservice.miaccount import get_random
+
+    pass_token, user_id = (pass_token or "").strip(), str(user_id or "").strip()
+    if not pass_token or not user_id:
+        raise ValueError("passToken 和 userId 都要填")
+    account = MiAccount(None, "", "", token_store=TOKEN_PATH)
+    account.token = {"deviceId": get_random(16).upper(),
+                     "userId": user_id, "passToken": pass_token}
+    if not await _login_via_passtoken(account):
+        raise ValueError("passToken 未被小米接受（原因见日志），"
+                         "请确认是 account.xiaomi.com 域下的最新值")
+    lst = (await MiNAService(account).device_list()) or []
+    if not lst:
+        raise ValueError("登录成功，但账号下没有小爱音箱")
+    chosen = next((d for d in lst if SPEAKER and SPEAKER in
+                   (d.get("name"), d.get("deviceID"))), lst[0])
+    cookie = {"userId": account.token["userId"],
+              "serviceToken": account.token["micoapi"][1],
+              "deviceId": chosen.get("deviceID")}
+    s = _session
+    s["account"] = account
+    s["cookie"] = cookie
+    s["hardware"] = chosen.get("hardware", "")
+    s["id"] = chosen.get("deviceID", "")
+    s["name"] = chosen.get("name", "")
+    _speaker_info.update({"name": s["name"], "hardware": s["hardware"], "id": s["id"]})
+    log.info("面板登录成功，使用音箱：%s (%s)", s["name"], s["hardware"])
+    _start_poll_task()
+    return {"name": s["name"], "hardware": s["hardware"]}
+
+
+async def runtime_logout() -> None:
+    """面板退出登录：停监听、删令牌、清状态。"""
+    s = _session
+    if s["poll_task"] and not s["poll_task"].done():
+        s["poll_task"].cancel()
+        try:
+            await s["poll_task"]
+        except asyncio.CancelledError:
+            pass
+    s.update({"account": None, "cookie": {}, "hardware": "", "id": "",
+              "name": "", "poll_task": None})
+    _speaker_info.update({"name": "", "hardware": "", "id": ""})
+    try:
+        os.remove(TOKEN_PATH)
+        log.info("已退出登录：令牌已删除，监听停止")
+    except FileNotFoundError:
+        log.info("已退出登录：本来就没有令牌")
+    except Exception as e:  # noqa: BLE001
+        log.warning("删除令牌失败: %s", e)
 
 PANEL_HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -632,6 +703,7 @@ PANEL_HTML = r"""<!DOCTYPE html>
   <button data-tab="add">添加口令</button>
   <button data-tab="test">测试</button>
   <button data-tab="log">日志</button>
+  <button data-tab="acct">账号</button>
 </nav>
 <main>
 
@@ -703,6 +775,33 @@ PANEL_HTML = r"""<!DOCTYPE html>
   </div>
 </div>
 
+<div id="tab-acct" class="tab" style="display:none">
+  <div class="card">
+    <h3>账号状态</h3>
+    <div id="acct-status">加载中…</div>
+    <div class="row" style="margin-top:10px">
+      <button class="act danger" id="btn-logout" style="display:none" onclick="doLogout()">退出登录</button>
+    </div>
+  </div>
+  <div class="card" id="login-card">
+    <h3>登录（浏览器 passToken 免密方式）</h3>
+    <div class="hint">
+      1. 浏览器打开 <b>account.xiaomi.com</b> 并登录同一个账号<br>
+      2. 按 F12 → Application(应用) → Cookies → https://account.xiaomi.com<br>
+      3. 复制 <b>passToken</b>（长字符串）和 <b>userId</b>（纯数字）粘贴到下面
+    </div>
+    <label>passToken</label>
+    <textarea id="in-pt" rows="3" style="width:100%; box-sizing:border-box; font-size:12px"
+              placeholder="V1:xxxxxxxx…"></textarea>
+    <label>userId（纯数字）</label>
+    <input type="text" id="in-uid" placeholder="例如 1234567890">
+    <div class="row" style="margin-top:10px">
+      <button class="pri" onclick="doLogin()">登录</button>
+    </div>
+    <div class="msg" id="msg-acct"></div>
+  </div>
+</div>
+
 </main>
 <script>
 let CMDS = [];
@@ -716,6 +815,7 @@ document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
   $('tab-' + b.dataset.tab).style.display = '';
   if (b.dataset.tab === 'log') refreshLog();
   if (b.dataset.tab === 'list') refreshCmds();
+  if (b.dataset.tab === 'acct') refreshAcct();
 });
 
 async function jget(url) { const r = await fetch(url); return r.json(); }
@@ -904,6 +1004,42 @@ async function refreshLog() {
   if (stick) box.scrollTop = box.scrollHeight;
 }
 
+async function refreshAcct() {
+  const s = await jget('/api/status');
+  const el = $('acct-status');
+  if (s.logged_in) {
+    el.innerHTML = '<span style="color:#2a9d5c">● 已登录</span>｜音箱：' + s.speaker +
+                   '（' + s.hardware + '）｜口令 ' + s.commands + ' 条｜每 ' + s.poll + 's 轮询';
+    $('btn-logout').style.display = '';
+    $('login-card').style.display = 'none';
+  } else {
+    el.innerHTML = '<span style="color:#c0392b">● 未登录</span>——监听未运行，请在下方登录';
+    $('btn-logout').style.display = 'none';
+    $('login-card').style.display = '';
+  }
+  $('status').textContent = s.logged_in
+    ? `音箱：${s.speaker}（${s.hardware}）｜口令 ${s.commands} 条｜每 ${s.poll}s 轮询`
+    : '未登录——登录后开始监听';
+}
+
+async function doLogin() {
+  const d = await jpost('/api/login', {passToken: $('in-pt').value, userId: $('in-uid').value});
+  if (d.ok) {
+    showMsg('msg-acct', '登录成功，音箱：' + d.name, true);
+    $('in-pt').value = ''; $('in-uid').value = '';
+    refreshAcct();
+  } else {
+    showMsg('msg-acct', d.error || '登录失败，详见日志页', false);
+  }
+}
+
+async function doLogout() {
+  if (!confirm('退出登录后监听停止、已保存的令牌删除，确定？')) return;
+  const d = await jpost('/api/logout', {});
+  showMsg('msg-acct', d.ok ? '已退出登录' : (d.error || '失败'), d.ok);
+  refreshAcct();
+}
+
 function showMsg(id, text, ok) {
   const el = $(id);
   el.className = 'msg ' + (ok ? 'ok' : 'err');
@@ -917,6 +1053,7 @@ function showMsg(id, text, ok) {
   PANEL_ENTITIES = (await jget('/api/ha/entities')).entities || [];
   loadEntities();
   refreshCmds();
+  refreshAcct();
   setInterval(refreshLog, 2000);
 })();
 </script>
@@ -948,6 +1085,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
         elif self.path == "/api/status":
             self._send(200, {"speaker": _speaker_info["name"] or "未知",
                              "hardware": _speaker_info["hardware"] or "?",
+                             "logged_in": bool(_session["cookie"]),
                              "commands": len(COMMANDS), "poll": POLL_INTERVAL})
         else:
             self._send(404, {"error": "not found"})
@@ -985,6 +1123,17 @@ class _PanelHandler(BaseHTTPRequestHandler):
             code, resp = exec_command(cmd)
             log.info("面板手动执行 %s -> HTTP %s", cmd.get("script") or cmd.get("service"), code)
             self._send(200, {"code": code, "body": resp[:120]})
+        elif self.path in ("/api/login", "/api/logout") and _LOOP is not None:
+            # 登录/登出需要在主事件循环里跑（miservice 是异步的）
+            coro = runtime_login(body.get("passToken", ""), body.get("userId", "")) \
+                if self.path == "/api/login" else runtime_logout()
+            fut = asyncio.run_coroutine_threadsafe(coro, _LOOP)
+            try:
+                result = fut.result(timeout=90)
+            except Exception as e:  # noqa: BLE001
+                self._send(200, {"ok": False, "error": str(e)[:300]})
+            else:
+                self._send(200, {"ok": True, **(result or {})})
         else:
             self._send(404, {"error": "not found"})
 
@@ -1005,6 +1154,7 @@ def start_panel() -> None:
 
 
 async def main_async() -> None:
+    global _LOOP
     ap = argparse.ArgumentParser(description="小爱语音 -> HA 桥接")
     ap.add_argument("--login", action="store_true", help="登录并保存令牌（默认免密：令牌/浏览器 passToken）")
     ap.add_argument("--password", action="store_true",
@@ -1022,6 +1172,9 @@ async def main_async() -> None:
         return
 
     account, cookie, hardware, device_id, name = await build_session(args.password)
+    _session.update({"account": account, "cookie": cookie, "hardware": hardware,
+                     "id": device_id, "name": name})
+    _LOOP = asyncio.get_running_loop()
     start_panel()
 
     if args.devices:
@@ -1031,7 +1184,12 @@ async def main_async() -> None:
                      d.get("hardware"), d.get("deviceID"))
         return
 
-    await poll_loop(hardware, cookie, probe_seconds=args.probe or 0)
+    if args.probe:
+        await poll_loop(hardware, cookie, probe_seconds=args.probe)
+        return
+
+    _start_poll_task()
+    await asyncio.Event().wait()   # 常驻；面板可随时退出/重登录并重启监听
 
 
 def main() -> None:
