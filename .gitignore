@@ -17,6 +17,13 @@ blueprints/
 /secrets.yaml
 /automations.yaml
 
+# voice_bridge 运行时产物（令牌、状态、日志、个人口令配置，绝不能提交）
+.mi.token
+voice_bridge.state
+voice_bridge.log
+voice_bridge.log.*
+/voice_bridge.json
+
 # 备份与临时文件
 *.bak
 *.tmp
