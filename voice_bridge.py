@@ -490,6 +490,40 @@ def _parse_json(raw: bytes) -> dict:
     return json.loads(txt or "{}")
 
 
+async def _relogin_cookie(old_cookie: dict) -> dict:
+    """serviceToken 过期时，用本地保存的 passToken 重新换一份，返回新 cookie。
+
+    passToken 通常几个月才过期，所以绝大多数「401 失效」都能这样无感续期；
+    连它也失效了才需要人工在面板「账号」页重新登录（此时抛异常）。
+    """
+    from miservice import MiAccount, MiNAService
+
+    account = MiAccount(None, "", "", token_store=TOKEN_PATH)
+    stored = await account.token_store.load_token()
+    if not stored:
+        raise RuntimeError("本地没有保存的令牌")
+    account.token = stored
+    if not await account.login("micoapi"):
+        raise RuntimeError(f"重登被拒: {getattr(account, '_login_error', '')[:120]}")
+    token = account.token
+    mina = MiNAService(account)
+    lst = (await mina.device_list()) or []
+    chosen = next((d for d in lst if d.get("deviceID") == old_cookie.get("deviceId")), None)
+    if chosen is None:
+        chosen = next((d for d in lst
+                       if d.get("deviceID") == _speaker_info.get("id")
+                       or d.get("hardware") == _speaker_info.get("hardware")), None)
+    if chosen is None:
+        raise RuntimeError("重登成功但找不到原来的音箱")
+    log.info("自动重登成功（音箱 %s）", chosen.get("name"))
+    return {"userId": token["userId"],
+            "serviceToken": token["micoapi"][1],
+            "deviceId": chosen.get("deviceID")}
+
+
+_last_relogin = 0.0   # 上次自动重登尝试时间（限流，5 分钟内不重复）
+
+
 async def fetch_records(cookie: dict, hardware: str) -> list[dict]:
     from miservice.biohttp import ClientSession
 
@@ -600,7 +634,25 @@ async def poll_loop(hardware: str, cookie: dict, probe_seconds: float = 0) -> No
             log.warning("轮询异常: %s: %s；%.0f 秒后重试",
                         type(e).__name__, str(e)[:150], backoff)
             if "401" in str(e) or "auth" in str(e).lower():
-                log.error("令牌可能已过期，请重新执行: voice_bridge.py --login")
+                # serviceToken 过期：先用本地 passToken 自动续期（5 分钟限流），
+                # 续不上才提示人工登录。cookie 原地更新，_session 同步生效
+                global _last_relogin
+                now = time.time()
+                if now - _last_relogin > 300:
+                    _last_relogin = now
+                    try:
+                        log.warning("令牌失效，尝试用已保存的 passToken 自动续期…")
+                        fresh = await _relogin_cookie(cookie)
+                        cookie.clear()
+                        cookie.update(fresh)
+                        log.info("自动续期完成，继续监听（无需人工干预）")
+                        backoff = 1.0
+                        continue
+                    except Exception as e2:  # noqa: BLE001
+                        log.error("自动续期失败(%s)，请在面板「账号」页重新登录",
+                                  str(e2)[:120])
+                else:
+                    log.error("令牌已失效且自动续期被限流，等待下次尝试")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, MAX_BACKOFF)
             continue
@@ -1386,6 +1438,13 @@ PANEL_HTML = r"""<!DOCTYPE html>
     <select id="sel-device" disabled onchange="onDevice()"><option value="">先选品牌</option></select>
     <label>指令</label>
     <select id="sel-entity" disabled><option value="">先选设备</option></select>
+    <div id="mode-wrap" style="display:none">
+      <label>动作</label>
+      <select id="sel-mode" onchange="onEntityChange()">
+        <option value="on">开启</option>
+        <option value="off">关闭</option>
+      </select>
+    </div>
     <div id="opt-wrap" style="display:none">
       <label>选择选项（选项类指令需要）</label>
       <select id="sel-option"></select>
@@ -1612,6 +1671,7 @@ $('sel-script').onchange = () => {
   if (sid) {
     $('sel-entity').value = '';
     $('opt-wrap').style.display = 'none';
+    $('mode-wrap').style.display = 'none';
     $('entity-preview').textContent = '动作：运行脚本 ' + sid;
   } else {
     $('entity-preview').textContent = '';
@@ -1623,6 +1683,7 @@ function onBrand() {
   const selD = $('sel-device'), selE = $('sel-entity');
   selE.disabled = true; selE.innerHTML = '<option value="">先选设备</option>';
   $('opt-wrap').style.display = 'none';
+  $('mode-wrap').style.display = 'none';
   $('entity-preview').textContent = '';
   if (!b) {
     selD.disabled = true; selD.innerHTML = '<option value="">先选品牌</option>';
@@ -1651,7 +1712,12 @@ function onDevice() {
   selE.disabled = false;
 }
 
-$('sel-entity').onchange = () => {
+/* 可开/关的域：除湿机、风扇、灯、开关等，都提供「开启/关闭」动作选择 */
+const TOGGLE_DOMAINS = new Set(['switch', 'humidifier', 'fan', 'light', 'siren', 'water_heater', 'climate']);
+const TOGGLE_SERVICE = {switch: 'switch', humidifier: 'humidifier', fan: 'fan',
+                        light: 'light', siren: 'siren', water_heater: 'water_heater', climate: 'climate'};
+
+function onEntityChange() {
   const eid = $('sel-entity').value;
   if (eid) {
     $('sel-script').value = '';
@@ -1659,14 +1725,18 @@ $('sel-entity').onchange = () => {
   }
   const e = (PANEL_ENTITIES||[]).find(x => x.entity_id === eid);
   const domain = eid.split('.')[0];
+  const toggle = TOGGLE_DOMAINS.has(domain);
+  $('mode-wrap').style.display = eid && toggle ? '' : 'none';
   $('opt-wrap').style.display = domain === 'select' ? '' : 'none';
   if (domain === 'select' && e) {
     $('sel-option').innerHTML = (e.options||[]).map(o => `<option value="${o}">${o}</option>`).join('');
   }
-  $('entity-preview').textContent = eid ? '动作：' + ({
-    button:'按下按钮', select:'切换到指定选项', switch:'开启',
-    vacuum:'执行服务', script:'运行脚本', fan:'开启', light:'开启'}[domain] || domain) : '';
-};
+  const onoff = toggle ? ($('sel-mode').value === 'on' ? '开启' : '关闭') : null;
+  $('entity-preview').textContent = eid ? '动作：' + (onoff || {
+    button:'按下按钮', select:'切换到指定选项',
+    vacuum:'执行服务', script:'运行脚本'}[domain] || domain) : '';
+}
+$('sel-entity').onchange = onEntityChange;
 let PANEL_ENTITIES = [];
 
 async function saveCmd() {
@@ -1683,7 +1753,12 @@ async function saveCmd() {
   else if (domain === 'select') { cmd.service = 'select/select_option';
     cmd.data = {entity_id: eid, option: $('sel-option').value}; }
   else if (domain === 'script') { cmd.script = eid.split('.')[1] || eid; }
-  else { cmd.service = 'switch/turn_on'; cmd.data = {entity_id: eid}; }
+  else if (TOGGLE_DOMAINS.has(domain)) {
+    // 开/关动作：用实体自己域的服务，而不是硬编码 switch/turn_on
+    const svc = TOGGLE_SERVICE[domain] + ($('sel-mode').value === 'on' ? '/turn_on' : '/turn_off');
+    cmd.service = svc; cmd.data = {entity_id: eid};
+  }
+  else { cmd.service = domain + '/turn_on'; cmd.data = {entity_id: eid}; }
   const d = await jpost('/api/commands', {commands: CMDS.concat([cmd])});
   if (d.ok) {
     show(true, '已保存并生效');
