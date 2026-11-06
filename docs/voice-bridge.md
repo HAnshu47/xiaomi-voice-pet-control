@@ -100,6 +100,30 @@ PetKit 集成 → 小佩设备执行
 面板还会探测 HA 是否在运行：没运行会在集成中心顶部显示提示卡，
 点「启动 Home Assistant」即可后台拉起 `hass.exe`（独立进程，面板退出不影响）。
 
+> **Windows 原生跑 HA 的两个坑**
+>
+> 1. 探活只连 TCP 端口，不再请求 `/api/`。无令牌请求会被 HA 记成一次「登录失败」，
+>    日志刷满 `invalid authentication`，次数够多会把 `127.0.0.1` 封禁（403），
+>    之后面板会一直显示「HA 未运行」，只能重启 HA 才恢复。
+> 2. 没有服务管理器托管时，HA 收到「重启」指令会以退出码 100 直接结束进程、
+>    **不会自己回来**。所以面板在安装/卸载集成后会一直盯着端口，一旦关闭就立刻重新拉起。
+> 3. HA 以 `CREATE_BREAKAWAY_FROM_JOB` 脱离面板的进程树启动，关掉面板窗口不会连带杀掉 HA；
+>    看门狗不区分 HA 由谁启动，检测到掉线就自动拉回（30 分钟内最多 6 次，防启动即崩溃的死循环），
+>    面板刚启动时若发现 HA 没运行也会在 10 秒内自动拉起。
+
+> **装完集成点「配置」没反应？通常是它的 Python 依赖装不上**
+>
+> 面板会把 HA 的原始报错显示出来，并顺带提示缺哪个依赖。常见两种：
+>
+> - **依赖要求的 Python 版本比 HA 高**。例：`deye_dehumidifier` 3.x 依赖 `libdeye==3.0.4`，
+>   而后者要求 Python ≥ 3.14.2；HA 若跑在 3.12/3.13，这个集成根本加载不了。
+>   改装有对应旧版本的集成（如 `v2.1.8` → `libdeye==2.1.6`）即可。
+> - **`aiodns` + Windows 冲突**。Windows 上 HA 用的是 Proactor 事件循环，而 aiodns 要求
+>   SelectorEventLoop，任何用到 HA 共享 aiohttp 会话的集成都会报
+>   `aiodns needs a SelectorEventLoop on Windows`。
+>   处理：`python -m pip uninstall aiodns`（aiohttp 会自动回落到线程 DNS 解析）。
+>   注意升级 HA 时 pip 可能把 aiodns 又装回来，报错复发就再卸一次。
+
 > 安装来源限制在 GitHub 公开仓库的 HA 集成，**不执行任意脚本**；
 > 但仍建议优先选 star 多、更新活跃的仓库，第三方集成代码质量需自行判断。
 

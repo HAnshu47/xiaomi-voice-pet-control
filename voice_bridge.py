@@ -217,42 +217,57 @@ def exec_command(cmd: dict) -> tuple[int, str]:
 
 
 # 集成 -> 品牌显示名。按实体「所属 HA 集成」分品牌，避免厂商名把同一
-# 集成的设备拆散（如小米米家集成下厂商有 小米/米家/小白 等多种）
-INTEGRATION_CANDIDATES = ["xiaomi_home", "xiaomi_miot", "miio", "petkit", "tuya",
-                          "mqtt", "esphome", "shelly", "switch_as_x", "template"]
+# 集成的设备拆散（如小米米家集成下厂商有 小米/米家/小白 等多种）。
+# 集成列表从 HA config_entries 动态获取，新装的品牌集成（如德业）自动出现。
 BRAND_LABELS = {"xiaomi_home": "小米米家", "xiaomi_miot": "小米米家",
                 "miio": "小米米家", "xiaomi": "小米米家", "mijia": "小米米家",
-                "petkit": "小佩 PetKit", "tuya": "涂鸦"}
+                "petkit": "小佩 PetKit", "tuya": "涂鸦",
+                "deye_dehumidifier": "德业 Deye"}
+_ha_titles = {}                        # 集成域名 -> 集成显示名（config entry title）
 _ha_emap = {"value": {}, "exp": 0.0}   # 实体 -> 集成 映射缓存
 
 
 def _ha_integration_map() -> dict:
-    """返回 {entity_id: 集成域名}。用一次模板调用批量反查，缓存 10 分钟。"""
+    """返回 {entity_id: 集成域名}，同时填充 _ha_titles（域名 -> 显示名）。
+
+    分两步：先从 /api/config/config_entries/entry 拿真实安装的集成，
+    再用一次模板调用把每个集成的实体批量反查出来，缓存 10 分钟。
+    """
     if _ha_emap["value"] and time.time() < _ha_emap["exp"]:
         return _ha_emap["value"]
     from urllib import request as urlrequest
 
-    doms = ", ".join(f"'{d}'" for d in INTEGRATION_CANDIDATES)
-    tpl = (
-        "{% set ns = namespace(out={}) %}"
-        f"{{% for dom in [{doms}] %}}"
-        "{% for eid in integration_entities(dom) %}"
-        "{% set ns.out = dict(ns.out, **{eid: dom}) %}"
-        "{% endfor %}{% endfor %}{{ ns.out | to_json }}"
-    )
+    heads = {"Authorization": f"Bearer {_ha_token_get()}",
+             "Content-Type": "application/json"}
     try:
-        req = urlrequest.Request(
-            f"{HA_BASE}/api/template", method="POST",
-            data=json.dumps({"template": tpl}).encode(),
-            headers={"Authorization": f"Bearer {_ha_token_get()}",
-                     "Content-Type": "application/json"},
+        req = urlrequest.Request(f"{HA_BASE}/api/config/config_entries/entry",
+                                 headers=heads)
+        with _ha_open(req, 20) as r:
+            entries = json.loads(r.read().decode("utf-8", "replace"))
+        doms = sorted({e["domain"] for e in entries if e.get("domain")})
+        _ha_titles.clear()
+        for e in entries:
+            title = (e.get("title") or e["domain"]).strip()
+            _ha_titles.setdefault(e["domain"], title)
+
+        parts = ", ".join(f"'{d}'" for d in doms)
+        tpl = (
+            "{% set ns = namespace(out={}) %}"
+            f"{{% for dom in [{parts}] %}}"
+            "{% for eid in integration_entities(dom) %}"
+            "{% set ns.out = dict(ns.out, **{eid: dom}) %}"
+            "{% endfor %}{% endfor %}{{ ns.out | to_json }}"
         )
-        with _ha_open(req, 30) as r:
+        req2 = urlrequest.Request(
+            f"{HA_BASE}/api/template", method="POST",
+            data=json.dumps({"template": tpl}).encode(), headers=heads,
+        )
+        with _ha_open(req2, 30) as r:
             _ha_emap["value"] = json.loads(r.read().decode("utf-8", "replace"))
         _ha_emap["exp"] = time.time() + 600
     except Exception as e:  # noqa: BLE001
-        log.warning("拉取集成映射失败(品牌将按厂商显示): %s", e)
-        _ha_emap["exp"] = time.time() + 60
+        log.warning("拉取集成映射失败(品牌将按厂商显示，HA 就绪后自动恢复): %s", e)
+        _ha_emap["exp"] = time.time() + 15   # 失败很快重试，别让用户刷新 1 分钟才恢复
     return _ha_emap["value"]
 
 
@@ -272,9 +287,13 @@ def ha_get_states() -> list:
         # HA 没启动时会被反复调用，60 秒内只提醒一次，避免刷屏
         if time.time() - _ha_warn_at > 60:
             _ha_warn_at = time.time()
-            log.warning("拉取 HA 实体失败(HA 未运行？): %s", e)
+            if ha_starting():
+                log.info("HA 正在启动中，实体列表就绪后自动加载（连接暂不可用属正常）")
+            else:
+                log.warning("拉取 HA 实体失败（HA 未运行？去集成中心点「启动 Home Assistant」）: %s", e)
         return []
-    keep = {"button", "select", "switch", "vacuum", "script", "fan", "light"}
+    keep = {"button", "select", "switch", "vacuum", "script", "fan", "light",
+            "humidifier", "climate"}
     out = []
     for s in states:
         domain = s["entity_id"].split(".", 1)[0]
@@ -321,7 +340,7 @@ def ha_get_states() -> list:
         else:
             dom = emap.get(item["entity_id"])
             if dom:
-                item["brand"] = BRAND_LABELS.get(dom, dom)
+                item["brand"] = BRAND_LABELS.get(dom) or _ha_titles.get(dom) or dom
             else:
                 mfr = str(info.get("b", "")).strip()
                 item["brand"] = mfr or "其他设备"
@@ -796,25 +815,63 @@ _HA_EXE_CANDIDATES = (
 )
 
 
-def ha_alive() -> bool:
-    """HA 的 /api/ 是否可用（不需要令牌也能判断进程在不在）。"""
-    from urllib import error as urlerror, request as urlrequest
+_HA_STATE = {
+    "start_ts": 0.0,      # 最近一次由面板拉起 HA 的时间
+    "spawn_ts": 0.0,      # 上一次真正执行 Popen 的时间（防抖，避免拉起两个 HA）
+    "managed": False,     # HA 是面板拉起来的（掉线时自动拉回来）
+    "was_alive": False,   # 上一轮探活结果，用于识别「刚刚掉线」
+    "restarts": [],       # 自动拉起时间戳，用于限流
+}
+_HA_LOCK = threading.Lock()
 
+
+def _ha_host_port() -> tuple[str, int]:
+    from urllib.parse import urlparse
+
+    u = urlparse(HA_BASE)
+    return (u.hostname or "127.0.0.1"), int(u.port or 8123)
+
+
+def ha_alive() -> bool:
+    """HA 是否在运行：只探 TCP 端口，不发 HTTP 请求。
+
+    以前是请求 /api/ 看 401，但无令牌请求会被 HA 记成一次「登录失败」，
+    日志里刷满 invalid authentication，次数多了直接把 127.0.0.1 封掉，
+    之后所有请求 403 —— 面板就会一直显示「HA 未运行」，只能靠重启 HA 解除。
+    """
+    import socket
+
+    host, port = _ha_host_port()
     try:
-        with _ha_open(f"{HA_BASE}/api/", 3) as r:
-            return r.status in (200, 401)
-    except urlerror.HTTPError as e:
-        return e.code == 401
-    except Exception:  # noqa: BLE001
+        with socket.create_connection((host, port), timeout=1.5):
+            return True
+    except OSError:
         return False
 
 
-def ha_start() -> dict:
+def ha_starting() -> bool:
+    """HA 是否正处于「已拉起但还没监听端口」的启动窗口内。"""
+    if ha_alive():
+        return False
+    ts = _HA_STATE["start_ts"]
+    return bool(ts) and time.time() - ts < 240
+
+
+def ha_start(force: bool = False) -> dict:
     """后台拉起 HA（hass.exe），成功返回 launched。"""
     import subprocess
 
-    if ha_alive():
-        return {"ok": True, "msg": "HA 已在运行"}
+    with _HA_LOCK:
+        if ha_alive():
+            return {"ok": True, "msg": "HA 已在运行"}
+        now = time.time()
+        if not force and _HA_STATE["start_ts"] and now - _HA_STATE["start_ts"] < 240:
+            return {"ok": True,
+                    "msg": f"HA 正在启动中（已 {int(now - _HA_STATE['start_ts'])} 秒），再等 1 分钟看看"}
+        # 30 秒防抖：看门狗和面板同时触发时只拉起一个进程
+        if now - _HA_STATE["spawn_ts"] < 30:
+            return {"ok": True, "msg": "HA 正在启动中…"}
+        _HA_STATE["spawn_ts"] = now
 
     exe = None
     for p in _HA_EXE_CANDIDATES:
@@ -827,59 +884,101 @@ def ha_start() -> dict:
     if exe is None:
         return {"ok": False, "error": "找不到 hass.exe，请确认 Python 环境或手动双击 start_ha.bat"}
 
-    # 脱离控制台启动，voice_bridge 退出后 HA 仍存活
+    # 脱离控制台 + 脱离父进程的 Job：否则关掉面板窗口（或 Windows 收割 Job）时
+    # HA 会作为子进程被连带杀掉——实测出现过「重启面板后 HA 无痕消失」
     flags = 0
     if os.name == "nt":
-        flags = 0x00000008 | 0x00000200   # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
-    try:
+        flags = 0x00000008 | 0x00000200 | 0x01000000
+        # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB
+
+    def _spawn(f: int) -> None:
         subprocess.Popen(
             [exe, "--config", str(HA_CONFIG_DIR), "--ignore-os-check"],
-            cwd=str(HA_CONFIG_DIR), creationflags=flags,
+            cwd=str(HA_CONFIG_DIR), creationflags=f,
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, close_fds=True,
         )
+
+    try:
+        try:
+            _spawn(flags)
+        except OSError:
+            # 某些环境不允许 breakaway（Job 未开放权限），去掉该标志重试
+            _spawn(flags & ~0x01000000 if os.name == "nt" else flags)
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "error": f"启动失败: {e}"}
+    with _HA_LOCK:
+        _HA_STATE["start_ts"] = time.time()
+        _HA_STATE["managed"] = True
     log.info("已尝试启动 Home Assistant（约 1~2 分钟就绪）")
     return {"ok": True, "msg": "已启动，约 1~2 分钟就绪"}
 
 
-async def _ic_restart_ha(timeout_s: int = 150) -> str:
+async def _ic_restart_ha(timeout_s: int = 240) -> str:
     """重启 HA 并等它回来。
 
-    返回 "skipped"（HA 本来没运行，不用重启）/ "ok" / "restarted"（自动拉起成功）。
+    Windows 原生跑 HA 没有服务管理器：HA 收到重启指令后会以退出码 100 直接结束，
+    没有任何东西把它重新拉起来。所以这里一旦看到端口关闭就立刻自己拉起，
+    而不是干等它「自己恢复」。
+
+    返回 "skipped"（HA 本来没运行）/ "ok"（重启指令无效，进程没退）/ "restarted"。
     """
     if not ha_alive():
         log.warning("HA 未运行，跳过重启（启动 HA 后集成即生效）")
         return "skipped"
 
     call_ha("homeassistant/restart", {})
-    # 先等它真的停下去（否则会把「正在关机」的旧进程误判为已恢复）
+    # 等端口真的关掉（否则会把「正在关机」的旧进程误判为已恢复）
     down = False
-    for _ in range(20):
-        await asyncio.sleep(3)
+    for _ in range(30):
+        await asyncio.sleep(2)
         if not ha_alive():
             down = True
             break
     if not down:
-        log.warning("HA 没有进入重启状态（可能重启指令未生效），继续按存活处理")
+        log.warning("HA 没有进入重启状态（可能重启指令未生效），按存活处理")
+        return "ok"
 
+    log.info("HA 已退出，正在重新拉起…")
+    ha_start(force=True)
     deadline = time.time() + timeout_s
     while time.time() < deadline:
-        if ha_alive():
-            return "ok"
-        await asyncio.sleep(3)
-
-    # 重启后没回来：可能是进程直接退出了，尝试自己拉起来
-    log.warning("HA 重启后未恢复，尝试手动启动")
-    ha_start()
-    deadline = time.time() + 180
-    while time.time() < deadline:
         await asyncio.sleep(3)
         if ha_alive():
+            log.info("HA 已恢复")
             return "restarted"
     raise ValueError("HA 重启后未能恢复（已尝试自动拉起）。"
                      "请双击 start_ha.bat 或点「启动 Home Assistant」后重试")
+
+
+def _ha_watchdog() -> None:
+    """后台看门狗：HA 掉线就自动拉回来（不管当初是谁启动的），最多 6 次/30 分钟。"""
+    while True:
+        time.sleep(10)
+        try:
+            alive = ha_alive()
+            was = _HA_STATE["was_alive"]
+            _HA_STATE["was_alive"] = alive
+            if alive or ha_starting():
+                continue
+
+            # 只处理「刚刚掉线」，避免启动窗口内被反复拉起
+            with _HA_LOCK:
+                now = time.time()
+                _HA_STATE["restarts"] = [t for t in _HA_STATE["restarts"] if now - t < 1800]
+                if len(_HA_STATE["restarts"]) >= 6:
+                    if was:
+                        log.warning("HA 掉线次数过多（30 分钟 6 次），暂停自动拉起，"
+                                    "可能有启动即崩溃的问题，请看 HA 日志")
+                    continue
+                _HA_STATE["restarts"].append(now)
+            if was:
+                log.warning("HA 已掉线，自动重新拉起（第 %d 次）", len(_HA_STATE["restarts"]))
+            r = ha_start(force=True)
+            if not r.get("ok"):
+                log.warning("自动拉起 HA 失败：%s", r.get("error"))
+        except Exception as e:  # noqa: BLE001
+            log.debug("HA 看门狗异常: %s", e)
 
 
 def _ic_download(url: str) -> bytes:
@@ -1050,7 +1149,7 @@ async def ic_install(domain: str = "", repo: str = "") -> None:
         f.write_bytes(content)
     log.info("集成已解压: %s -> %s (%d 个文件)", repo or domain, dest, len(files))
 
-    _ic_set("restarting", "安装完成，正在重启 HA（约 1 分钟）…", domain=real_domain)
+    _ic_set("restarting", "安装完成，正在重启并重新拉起 HA（约 1~2 分钟）…", domain=real_domain)
     result = await _ic_restart_ha()
 
     if result == "skipped":
@@ -1108,6 +1207,64 @@ async def ic_flow_start(handler: str) -> dict:
     status, data = _ha_api("POST", "/api/config/config_entries/flow",
                            {"handler": handler})
     return {"status": status, **data}
+
+
+def _ic_manifest(domain: str) -> dict:
+    """读 custom_components/<domain>/manifest.json，读不到返回 {}。"""
+    mf = HA_CONFIG_DIR / "custom_components" / (domain or "") / "manifest.json"
+    try:
+        return json.loads(mf.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _ha_python() -> str:
+    """HA 用的那个 python.exe（面板自己跑在 venv 里，依赖装的位置不一样）。"""
+    for p in _HA_EXE_CANDIDATES:
+        if Path(p).is_file():
+            cand = Path(p).parent.parent / "python.exe"
+            if cand.is_file():
+                return str(cand)
+            break
+    return sys.executable
+
+
+def ic_missing_requirements(domain: str) -> list[str]:
+    """该集成 manifest 里声明、但 HA 的 Python 环境里没装的依赖。
+
+    只用来在报错时给提示（不拦操作），所以模块名猜错也只会少提示、不会误伤。
+    """
+    import re
+    import subprocess
+
+    reqs = [str(r) for r in (_ic_manifest(domain).get("requirements") or [])]
+    mods, mapping = [], {}
+    for r in reqs:
+        m = re.match(r"\s*([A-Za-z0-9_.\-]+)", r)
+        if not m:
+            continue
+        mod = m.group(1).replace("-", "_").lower()
+        # paho-mqtt 这类包的实际 import 名是 paho，多给几个候选，避免误报
+        cands = [mod]
+        if "_" in mod:
+            cands.append(mod.split("_")[0])
+        if mod.startswith("python_"):
+            cands.append(mod[len("python_"):])
+        mods.append("|".join(cands))
+        mapping["|".join(cands)] = r
+    if not mods:
+        return []
+    code = ("import importlib.util, json, sys\n"
+            "def ok(spec):\n"
+            "    return any(importlib.util.find_spec(m) is not None for m in spec.split('|'))\n"
+            "print(json.dumps([s for s in sys.argv[1:] if not ok(s)]))\n")
+    try:
+        p = subprocess.run([_ha_python(), "-c", code, *mods],
+                           capture_output=True, text=True, timeout=25)
+        missing = json.loads((p.stdout or "[]").strip() or "[]")
+        return [mapping.get(m, m) for m in missing]
+    except Exception:  # noqa: BLE001
+        return []
 
 
 async def ic_flow_submit(flow_id: str, fields: dict) -> dict:
@@ -1168,7 +1325,8 @@ PANEL_HTML = r"""<!DOCTYPE html>
   button.pri { background:var(--main); color:#fff; border:none; border-radius:6px; padding:8px 18px;
                cursor:pointer; font-size:14px; }
   button.danger { color:var(--err); }
-  input[type=text], select { border:1px solid var(--bd); border-radius:6px; padding:8px 10px;
+  input[type=text], input[type=password], input[type=number], select {
+               border:1px solid var(--bd); border-radius:6px; padding:8px 10px;
                font-size:14px; width:100%; }
   label { display:block; font-size:13px; color:#4a5568; margin:12px 0 4px; }
   .hint { font-size:12.5px; color:#718096; line-height:1.7; }
@@ -1182,6 +1340,15 @@ PANEL_HTML = r"""<!DOCTYPE html>
   .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
   .row > * { flex:1; }
   .row > button { flex:0 0 auto; }
+  /* 配置向导弹窗 */
+  #ic-modal { position:fixed; inset:0; background:rgba(15,23,42,.45); z-index:999;
+              display:flex; align-items:center; justify-content:center; padding:20px; }
+  #ic-login-card { width:min(440px,94vw); max-height:82vh; overflow-y:auto;
+                   margin:0; box-shadow:0 18px 48px rgba(15,23,42,.28); position:relative; }
+  #ic-modal .card h3 { padding-right:28px; }
+  .ic-x { position:absolute; top:8px; right:12px; font-size:22px; line-height:1;
+          color:#a0aec0; cursor:pointer; user-select:none; }
+  .ic-x:hover { color:var(--err); }
 </style>
 </head>
 <body>
@@ -1311,11 +1478,11 @@ PANEL_HTML = r"""<!DOCTYPE html>
 </div>
 <div id="tab-ic" class="tab" style="display:none">
   <div class="card" id="ha-down-card" style="display:none; border-color:#f6ad55; background:#fffaf0">
-    <h3>⚠️ Home Assistant 没有运行</h3>
-    <div class="hint" style="margin-bottom:8px">
+    <h3 id="ha-down-title">⚠️ Home Assistant 没有运行</h3>
+    <div class="hint" id="ha-down-hint" style="margin-bottom:8px">
       面板的所有设备动作都要靠 HA 执行，HA 关着就会一直报「连接被拒绝」。
     </div>
-    <button class="pri" onclick="haStart()">启动 Home Assistant</button>
+    <button class="pri" id="ha-start-btn" onclick="haStart()">启动 Home Assistant</button>
     <div class="msg" id="msg-ha"></div>
   </div>
   <div class="card">
@@ -1349,13 +1516,16 @@ PANEL_HTML = r"""<!DOCTYPE html>
       <button class="act" onclick="icReset()">任务好像卡住了，强制解除</button>
     </div>
   </div>
-  <div class="card" id="ic-login-card" style="display:none">
-    <h3 id="ic-login-title">配置 / 登录</h3>
-    <div id="ic-form"></div>
-    <div class="row" style="margin-top:10px">
-      <button class="pri" onclick="icSubmit()">提交</button>
+  <div id="ic-modal" style="display:none" onclick="if(event.target===this)icModalClose()">
+    <div class="card" id="ic-login-card">
+      <span class="ic-x" title="关闭" onclick="icModalClose()">×</span>
+      <h3 id="ic-login-title">配置 / 登录</h3>
+      <div id="ic-form"></div>
+      <div class="row" style="margin-top:10px">
+        <button class="pri" id="ic-submit-btn" onclick="icSubmit()">提交</button>
+      </div>
+      <div class="msg" id="msg-ic-flow"></div>
     </div>
-    <div class="msg" id="msg-ic-flow"></div>
   </div>
 </div>
 
@@ -1414,8 +1584,14 @@ const DOMAIN_LABEL = {button:'按钮', select:'选项', switch:'开关', vacuum:
                       script:'脚本', fan:'风扇', light:'灯'};
 const dlabel = d => DOMAIN_LABEL[d] || d;
 
-async function loadEntities() {
+async function loadEntities(force) {
   const selB = $('sel-brand'), selS = $('sel-script');
+  if (force || !PANEL_ENTITIES.length) {
+    try {
+      const r = await jget('/api/ha/entities');
+      PANEL_ENTITIES = r.entities || [];
+    } catch (e) { /* 保持原值，下面按空处理 */ }
+  }
   if (!PANEL_ENTITIES.length) {
     selB.innerHTML = '<option value="">HA 实体加载失败（HA 未运行？）</option>';
     return;
@@ -1647,10 +1823,47 @@ async function doLogout() {
 /* ---------- 集成中心 ---------- */
 let IC_FLOW = null;
 let IC_POLL_T = null;
+let HA_BOOT_T = null;
+
+/* HA 启动窗口内自动重试，就绪后自己收起提示，用户不用手动刷新或反复点启动 */
+function haBootWatch() {
+  if (HA_BOOT_T) return;
+  HA_BOOT_T = setInterval(async () => {
+    let d;
+    try { d = await jget('/api/ic/list'); } catch (e) { return; }
+    if (d.ha_alive) {
+      clearInterval(HA_BOOT_T); HA_BOOT_T = null;
+      showMsg('msg-ha', 'HA 已就绪', true, true);
+      refreshIC();
+      loadEntitiesWhenReady();
+    } else if (!d.ha_starting) {
+      clearInterval(HA_BOOT_T); HA_BOOT_T = null;
+      refreshIC();
+    }
+  }, 5000);
+}
+
+/* 端口通了不等于实体已加载完，实体列表空就再等一会儿（最多 2 分钟） */
+async function loadEntitiesWhenReady(tries) {
+  tries = tries || 0;
+  await loadEntities(true);
+  if (PANEL_ENTITIES.length || tries >= 24) return;
+  setTimeout(() => loadEntitiesWhenReady(tries + 1), 5000);
+}
 
 async function refreshIC() {
   const d = await jget('/api/ic/list');
+  const booting = !d.ha_alive && d.ha_starting;
+  if (booting) haBootWatch();
   $('ha-down-card').style.display = d.ha_alive ? 'none' : '';
+  if (!d.ha_alive) {
+    $('ha-down-title').textContent = booting ? '⏳ Home Assistant 正在启动…' : '⚠️ Home Assistant 没有运行';
+    $('ha-down-hint').textContent = booting
+      ? '首次启动要加载 100+ 实体，通常 1~2 分钟，期间刷新页面也只会显示这个状态，不用重复点启动。'
+      : '面板的所有设备动作都要靠 HA 执行，HA 关着就会一直报「连接被拒绝」。';
+    $('ha-start-btn').style.display = booting ? 'none' : '';
+    if (booting) showMsg('msg-ha', 'HA 启动中，就绪后会自动刷新…', true, true);
+  }
   $('ic-installed').innerHTML = d.installed.length
     ? '<table><tr><th>集成</th><th>版本</th><th>操作</th></tr>' +
       d.installed.map(i => `<tr><td>${i.name}（${i.domain}）</td><td>${i.version || '-'}</td>` +
@@ -1678,19 +1891,22 @@ async function refreshIC() {
 }
 
 async function haStart() {
+  $('ha-start-btn').disabled = true;
   showMsg('msg-ha', '正在启动 HA（约 1~2 分钟）…', true);
   const d = await jpost('/api/ha/start', {});
   if (d.ok) {
     showMsg('msg-ha', d.msg || '已启动', true);
+    haBootWatch();
     let n = 0;
     const t = setInterval(async () => {
       const r = await jget('/api/ic/list');
-      if (r.ha_alive || ++n > 30) {
+      if (r.ha_alive || ++n > 40) {
         clearInterval(t);
+        $('ha-start-btn').disabled = false;
         if (r.ha_alive) { showMsg('msg-ha', 'HA 已就绪', true); refreshIC(); }
       }
     }, 5000);
-  } else showMsg('msg-ha', d.error || '启动失败', false);
+  } else { $('ha-start-btn').disabled = false; showMsg('msg-ha', d.error || '启动失败', false); }
 }
 
 async function icSearch() {
@@ -1764,52 +1980,112 @@ async function icReset() {
   refreshIC();
 }
 
+let IC_BUSY = false;      // 防抖：一次只允许一个配置请求在飞
+
+/* 配置向导弹窗：打开 / 关闭（点 ×、点遮罩、按 Esc） */
+function icModalOpen() {
+  $('ic-modal').style.display = 'flex';
+}
+function icModalClose() {
+  $('ic-modal').style.display = 'none';
+  const m = $('msg-ic-flow');
+  m.className = 'msg';
+  m.dataset.text = '';
+  const btn = $('ic-submit-btn');
+  if (btn) btn.disabled = false;
+}
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && $('ic-modal').style.display !== 'none') icModalClose();
+});
+
 async function icFlow(domain) {
-  const d = await jpost('/api/ic/flow', {handler: domain});
-  IC_FLOW = d;
-  if (d.type === 'form') icRenderForm(d);
-  else if (d.type === 'external') {
-    $('ic-login-card').style.display = '';
-    $('ic-form').innerHTML =
-      `<p>该品牌需要 OAuth 授权，请在 HA 网页完成一次：</p>` +
-      `<p><a href="http://127.0.0.1:8123/config/integrations" target="_blank">点此打开 HA 集成页</a></p>` +
-      `<p class="hint">${(d.description_placeholders || {}).url || ''}</p>`;
-    $('msg-ic-flow').className = 'msg';
-  } else if (d.type === 'abort') {
-    showMsg('msg-ic-flow', '配置中止：' + (d.reason || '未知原因'), false);
-  } else showMsg('msg-ic-flow', '异常响应：' + JSON.stringify(d).slice(0, 150), false);
+  if (IC_BUSY) return;                 // 连点无效，避免重复创建 HA flow
+  IC_BUSY = true;
+  icModalOpen();
+  $('ic-login-title').textContent = '配置 / 登录：' + domain;
+  $('ic-form').innerHTML = '<p class="hint">正在打开配置向导…</p>';
+  showMsg('msg-ic-flow', '正在打开配置向导…', true, true);
+  try {
+    const d = await jpost('/api/ic/flow', {handler: domain});
+    IC_FLOW = d;
+    if (d.type === 'form') {
+      icRenderForm(d);
+    } else if (d.type === 'external') {
+      $('ic-form').innerHTML =
+        `<p>该品牌需要 OAuth 授权，请在 HA 网页完成一次：</p>` +
+        `<p><a href="http://127.0.0.1:8123/config/integrations" target="_blank">点此打开 HA 集成页</a></p>` +
+        `<p class="hint">${(d.description_placeholders || {}).url || ''}</p>`;
+      showMsg('msg-ic-flow', '需要在 HA 网页里完成授权', true, true);
+    } else if (d.type === 'abort') {
+      $('ic-form').innerHTML = '';
+      showMsg('msg-ic-flow', '配置中止：' + (d.reason || '未知原因') +
+              '（常见原因：这个账号已经添加过了）', false);
+    } else {
+      // 依赖没装好 / 集成加载失败时，HA 返回 4xx-5xx，这里必须把原因显出来
+      $('ic-form').innerHTML =
+        '<p class="hint">这个集成没能打开配置向导。通常是它的 Python 依赖装不上，' +
+        '或集成代码跟当前 HA / Python 版本不兼容。可以看「日志」页里 HA 的报错。</p>';
+      const msg = d.error || (d.message || JSON.stringify(d)).slice(0, 200);
+      showMsg('msg-ic-flow', msg, false);
+    }
+  } catch (e) {
+    $('ic-form').innerHTML = '';
+    showMsg('msg-ic-flow', '请求失败：' + e, false);
+  } finally {
+    IC_BUSY = false;
+  }
+}
+
+/* HA 的 data_schema 有两种形态：
+   老格式 [[key, {type,...}], ...]；REST 新版返回 [{type,name,required,...}, ...] */
+function icSchemaList(raw) {
+  return (raw || []).map(it => {
+    if (Array.isArray(it)) return {key: it[0], sch: it[1] || {}};
+    if (it && typeof it === 'object') return {key: it.name || '', sch: it};
+    return null;
+  }).filter(x => x && x.key);
 }
 
 function icRenderForm(step) {
-  $('ic-login-card').style.display = '';
-  $('ic-login-title').textContent = '配置 / 登录：' + (step.title || IC_FLOW.handler || '');
+  icModalOpen();
+  $('ic-login-title').textContent = '配置 / 登录：' + (step.title || (IC_FLOW && IC_FLOW.handler) || '');
   const ph = step.description_placeholders || {};
-  const schema = step.data_schema || [];
-  $('ic-form').innerHTML = schema.map(([key, sch]) => {
-    const label = ph[key] || key;
-    const val = sch.default != null ? sch.default : '';
-    if (sch.type === 'boolean') {
+  const ZH = {username: '账号 / 邮箱', password: '密码', email: '邮箱', phone: '手机号',
+              host: '主机地址', region: '区域', country: '国家/地区', name: '名称',
+              token: '访问令牌', api_key: 'API Key', port: '端口'};
+  const items = icSchemaList(step.data_schema);
+  $('ic-form').innerHTML = items.map(({key, sch}) => {
+    const label = ph[key] || (sch.name && ph[sch.name]) || ZH[key] || sch.name || key;
+    const suggested = (sch.description && sch.description.suggested_value != null)
+      ? sch.description.suggested_value : null;
+    const val = sch.default != null ? sch.default : (suggested != null ? suggested : '');
+    const type = String(sch.type || 'string').split(',')[0];
+    if (type === 'boolean') {
       return `<label>${label}</label><select id="f_${key}">` +
-        `<option value="true" ${val ? 'selected' : ''}>开</option>` +
+        `<option value="true" ${val === true ? 'selected' : ''}>开</option>` +
         `<option value="false" ${val === false ? 'selected' : ''}>关</option></select>`;
     }
-    if (sch.type === 'select') {
+    if (type === 'select' || type === 'multi_select') {
+      const opts = (sch.options || []).map(o => {
+        if (Array.isArray(o)) return [o[0], o[1]];
+        return [o.value != null ? o.value : o, o.label != null ? o.label : (o.value != null ? o.value : o)];
+      });
       return `<label>${label}</label><select id="f_${key}">` +
-        (sch.options || []).map(o => {
-          const [ov, ol] = Array.isArray(o) ? o : [o, o];
-          return `<option value="${ov}" ${ov === val ? 'selected' : ''}>${ol}</option>`;
-        }).join('') + '</select>';
+        opts.map(([ov, ol]) => `<option value="${ov}" ${String(ov) === String(val) ? 'selected' : ''}>${ol}</option>`).join('') +
+        `</select>`;
     }
-    if (sch.type === 'integer' || sch.type === 'float') {
+    if (type === 'integer' || type === 'float' || type === 'number') {
       return `<label>${label}</label><input type="number" id="f_${key}" value="${val}">`;
     }
     const isSecret = /pass|pwd|token|secret|key/i.test(key);
     return `<label>${label}</label><input type="${isSecret ? 'password' : 'text'}" id="f_${key}" value="${val}">`;
   }).join('') || '<p class="hint">本步骤无需填写，直接提交</p>';
   $('msg-ic-flow').className = 'msg';
+  $('msg-ic-flow').dataset.text = '';
 }
 
 async function icSubmit() {
+  if (IC_BUSY) return;
   if (!IC_FLOW || !IC_FLOW.flow_id) return showMsg('msg-ic-flow', '没有进行中的配置', false);
   const fields = {};
   $('ic-form').querySelectorAll('[id^="f_"]').forEach(el => {
@@ -1819,23 +2095,49 @@ async function icSubmit() {
     else if (el.type === 'number') v = Number(v);
     fields[k] = v;
   });
-  const d = await jpost('/api/ic/flow_submit', {flow_id: IC_FLOW.flow_id, fields});
-  IC_FLOW = d;
-  if (d.type === 'form') {
-    icRenderForm(d);
-    showMsg('msg-ic-flow', '本步已通过，继续填写', true);
-  } else if (d.type === 'create_entry') {
-    showMsg('msg-ic-flow', '✅ 配置成功！设备已接入，去「添加口令」页选它', true);
-    $('ic-login-card').style.display = 'none';
-    PANEL_ENTITIES = (await jget('/api/ha/entities')).entities || [];
-    loadEntities();
-  } else if (d.type === 'external') {
-    $('ic-form').innerHTML =
-      '<p>需要 OAuth 授权，请打开 <a href="http://127.0.0.1:8123/config/integrations" target="_blank">HA 集成页</a> 完成授权</p>';
-  } else if (d.type === 'abort') {
-    showMsg('msg-ic-flow', '配置中止：' + (d.reason || '未知原因') + '（可能是账号已配置过）', false);
-  } else {
-    showMsg('msg-ic-flow', '错误：' + JSON.stringify(d.errors || d).slice(0, 150), false);
+  IC_BUSY = true;
+  const btn = $('ic-submit-btn');
+  if (btn) btn.disabled = true;
+  showMsg('msg-ic-flow', '提交中…', true, true);
+  try {
+    const d = await jpost('/api/ic/flow_submit', {flow_id: IC_FLOW.flow_id, fields});
+    IC_FLOW = d;
+    // 注意：校验失败（如密码错）HA 返回的也是 type:form，但带 errors —— 必须先查 errors，
+    // 否则会把「账号或密码不对」误报成「本步已通过」
+    const ERR_ZH = {invalid_auth: '账号或密码不对', cannot_connect: '连不上服务器',
+                    invalid_host: '服务器地址不对', timeout_connect: '连接超时',
+                    unknown: '未知错误，稍后再试', already_configured: '这个账号已经配置过了',
+                    invalid_input: '填写内容不合法'};
+    const errText = (errs => {
+      if (!errs || !Object.keys(errs).length) return '';
+      return Object.entries(errs)
+        .map(([k, v]) => `${k === 'base' ? '' : k + ' '}${ERR_ZH[v] || v}`).join('；');
+    })(d.errors);
+    if (d.type === 'form' && errText) {
+      icRenderForm(d);
+      showMsg('msg-ic-flow', '提交被拒绝，配置还没完成：' + errText, false);
+    } else if (d.type === 'form') {
+      icRenderForm(d);
+      showMsg('msg-ic-flow', '本步已通过，继续填写下面的表单并再点「提交」', true);
+    } else if (d.type === 'create_entry') {
+      showMsg('msg-ic-flow', '✅ 配置成功！设备已接入，去「添加口令」页选它', true, true);
+      loadEntitiesWhenReady();
+      setTimeout(icModalClose, 1600);   // 停留 1.6 秒让用户看到成功提示再收起
+    } else if (d.type === 'external') {
+      $('ic-form').innerHTML =
+        '<p>需要 OAuth 授权，请打开 <a href="http://127.0.0.1:8123/config/integrations" target="_blank">HA 集成页</a> 完成授权</p>';
+    } else if (d.type === 'abort') {
+      showMsg('msg-ic-flow', '配置中止：' + (d.reason || '未知原因') + '（可能是账号已配置过）', false);
+    } else if (errText) {
+      showMsg('msg-ic-flow', '填写有误：' + errText, false);
+    } else {
+      showMsg('msg-ic-flow', '错误：' + String(d.error || JSON.stringify(d)).slice(0, 200), false);
+    }
+  } catch (e) {
+    showMsg('msg-ic-flow', '提交失败：' + e, false);
+  } finally {
+    IC_BUSY = false;
+    if (btn) btn.disabled = false;
   }
 }
 
@@ -1861,9 +2163,11 @@ function showMsg(id, text, ok, sticky) {
 (async function init() {
   const s = await jget('/api/status');
   $('status').textContent = `音箱：${s.speaker}（${s.hardware}）｜口令 ${s.commands} 条｜每 ${s.poll}s 轮询` +
-    (s.ha_alive ? '｜HA ✅' : '｜HA ❌ 未运行（去「集成中心」一键启动）');
+    (s.ha_alive ? '｜HA ✅' : (s.ha_starting ? '｜HA ⏳ 启动中' : '｜HA ❌ 未运行（去「集成中心」一键启动）'));
   PANEL_ENTITIES = (await jget('/api/ha/entities')).entities || [];
   loadEntities();
+  if (!PANEL_ENTITIES.length && s.ha_starting) haBootWatch();
+  else if (!PANEL_ENTITIES.length && s.ha_alive) loadEntitiesWhenReady();
   refreshCmds();
   refreshAcct();
   setInterval(refreshLog, 2000);
@@ -1914,7 +2218,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
             catalog = [dict(e, installed=e["domain"] in domains or bool(e.get("core")))
                        for e in IC_CATALOG]
             self._send(200, {"installed": installed, "catalog": catalog,
-                             "ha_alive": ha_alive(),
+                             "ha_alive": ha_alive(), "ha_starting": ha_starting(),
                              "state": _IC_STATE["state"], "msg": _IC_STATE["msg"]})
         elif self.path.startswith("/api/ic/search"):
             from urllib.parse import parse_qs, urlparse
@@ -1935,7 +2239,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
             self._send(200, {"speaker": _speaker_info["name"] or "未知",
                              "hardware": _speaker_info["hardware"] or "?",
                              "logged_in": bool(_session["cookie"]),
-                             "ha_alive": ha_alive(),
+                             "ha_alive": ha_alive(), "ha_starting": ha_starting(),
                              "commands": len(COMMANDS), "poll": POLL_INTERVAL})
         else:
             self._send(404, {"error": "not found"})
@@ -2021,9 +2325,17 @@ class _PanelHandler(BaseHTTPRequestHandler):
         elif self.path == "/api/ha/start":
             self._send(200, ha_start())
         elif self.path == "/api/ic/flow":
+            handler = str(body.get("handler", "") or "").strip()
             status, data = _ha_api("POST", "/api/config/config_entries/flow",
-                                   {"handler": str(body.get("handler", ""))})
-            self._send(200, {"status": status, **data})
+                                   {"handler": handler})
+            if status in (200, 201):
+                return self._send(200, {"status": status, **data})
+            # 4xx/5xx：把 HA 的原文 + 缺依赖的猜测一起给前端，别再静默失败
+            reason = str(data.get("message") or data.get("error") or data)[:180]
+            missing = ic_missing_requirements(handler)
+            tip = f"；疑似缺依赖：{', '.join(missing)}" if missing else ""
+            self._send(200, {"status": status, "type": "error",
+                             "error": f"HA 打不开「{handler}」的配置向导（HTTP {status}）：{reason}{tip}"})
         elif self.path == "/api/ic/flow_submit":
             status, data = _ha_api(
                 "POST", f"/api/config/config_entries/flow/{body.get('flow_id', '')}",
@@ -2060,16 +2372,27 @@ class _PanelHandler(BaseHTTPRequestHandler):
         pass
 
 
-def start_panel() -> None:
-    """在后台线程启动管理面板 HTTP 服务。"""
+class _PanelServer(ThreadingHTTPServer):
+    # 禁用 SO_REUSEADDR：Windows 下它允许两个实例绑定同一个 8124 端口且不报错，
+    # 请求随机分给新旧实例，表现为「改了没生效 / 时对时错」。关掉后重复启动会直接报错退出。
+    allow_reuse_address = False
+
+
+def start_panel() -> bool:
+    """在后台线程启动管理面板 HTTP 服务。端口被占（已有实例）返回 False。"""
     try:
-        srv = ThreadingHTTPServer((PANEL_HOST, PANEL_PORT), _PanelHandler)
+        srv = _PanelServer((PANEL_HOST, PANEL_PORT), _PanelHandler)
     except OSError as e:
-        log.warning("面板启动失败(%s)，可能已被占用；若已有一个面板在跑可忽略", e)
-        return
+        log.error("面板启动失败（端口 %d 已被占用: %s）——已经有一个面板在运行了。\n"
+                  "请关闭所有旧面板窗口，只保留一个实例，再重新双击 start_voice.bat",
+                  PANEL_PORT, e)
+        return False
     threading.Thread(target=srv.serve_forever, daemon=True,
                      name="panel").start()
+    threading.Thread(target=_ha_watchdog, daemon=True,
+                     name="ha-watchdog").start()
     log.info("管理面板已启动: http://%s:%d", PANEL_HOST, PANEL_PORT)
+    return True
 
 
 async def main_async() -> None:
@@ -2099,7 +2422,8 @@ async def main_async() -> None:
         log.warning("没有已保存的登录令牌——监听暂不启动，"
                     "请打开管理面板「账号」页登录")
     _LOOP = asyncio.get_running_loop()
-    start_panel()
+    if not start_panel():
+        raise SystemExit("面板端口被占用，请关闭旧的面板窗口后重试")
 
     if args.devices:
         if not _session["account"]:
