@@ -154,59 +154,104 @@ _ha_warn_at = 0.0        # 上次「HA 拉取失败」告警时间，用于降�
 
 
 def _ha_ensure_owner() -> None:
-    """客户端全新配置时 HA 尚未 onboarding：自动创建 owner 用户。
+    """客户端全新配置时 HA 尚未 onboarding：自动创建 owner 并换出 refresh_token。
 
-    开发机上是手动注册的；分发的客户端必须全自动。创建 owner 后
-    .storage/auth 才有 owner 的 refresh_token，_ha_make_token 才能自签。
+    开发机上是手动注册的；分发的客户端必须全自动。_ha_make_token 需要
+    .storage/auth 里存在 owner 的 refresh_token，而 onboarding 的 users
+    步骤只建用户，令牌要再走 /api/auth/token 才会生成。
     """
-    try:
-        data = json.loads(Path(HA_AUTH_FILE).read_text(encoding="utf-8"))["data"]
-        owners = {u["id"] for u in data["users"] if u.get("is_owner")}
-        tokens = data["refresh_tokens"]
-        if isinstance(tokens, dict):
-            tokens = list(tokens.values())
-        if any(t.get("user_id") in owners for t in tokens):
-            return                                  # 已有 owner，无事可做
-    except Exception:
-        pass                                        # auth 文件还没生成也照走 onboarding
-    if not ha_alive():
-        return
-    from urllib import request as _ureq
     import secrets as _secrets
-    password = _secrets.token_urlsafe(12)
-    try:
-        (HA_CONFIG_DIR / ".owner.json").write_text(
-            json.dumps({"username": "owner", "password": password,
-                        "说明": "浏览器登录 HA 用的凭据（面板 OAuth 授权也会用到）"},
-                       ensure_ascii=False, indent=2),
-            encoding="utf-8")
-    except Exception:
-        pass
-    req = _ureq.Request(
-        f"{HA_BASE}/api/onboarding/users", method="POST",
-        data=json.dumps({"name": "管理员", "username": "owner",
-                         "password": password, "language": "zh-Hans",
-                         "client_id": f"{HA_BASE}/"}).encode(),
-        headers={"Content-Type": "application/json"})
-    try:
-        _ha_open(req, 20).read()
-        log.info("HA 首次初始化：已自动创建 owner 账号（凭据在 config/.owner.json）")
-    except Exception as e:
-        log.warning("HA onboarding 自动完成失败: %s", e)
-        return
-    for _ in range(20):                             # 等待 .storage/auth 落盘
-        time.sleep(1)
+    from urllib import request as _ureq
+    from urllib.parse import urlencode as _urlencode
+
+    def _owners_with_token() -> bool:
         try:
             data = json.loads(Path(HA_AUTH_FILE).read_text(encoding="utf-8"))["data"]
             owners = {u["id"] for u in data["users"] if u.get("is_owner")}
             tokens = data["refresh_tokens"]
             if isinstance(tokens, dict):
                 tokens = list(tokens.values())
-            if any(t.get("user_id") in owners for t in tokens):
-                return
+            return any(t.get("user_id") in owners for t in tokens)
         except Exception:
-            continue
-    log.warning("HA onboarding 已提交但 .storage/auth 未出现 owner 凭据")
+            return False
+
+    if _owners_with_token():
+        return
+
+    creds_file = HA_CONFIG_DIR / ".owner.json"
+    creds = {}
+    if creds_file.is_file():
+        try:
+            creds = json.loads(creds_file.read_text(encoding="utf-8"))
+        except Exception:
+            creds = {}
+    if not creds.get("password"):
+        creds = {"username": "owner", "password": _secrets.token_urlsafe(12)}
+        try:
+            creds_file.write_text(
+                json.dumps({"username": creds["username"],
+                            "password": creds["password"],
+                            "说明": "浏览器登录 HA 用的凭据（面板 OAuth 授权也会用到）"},
+                           ensure_ascii=False, indent=2),
+                encoding="utf-8")
+        except Exception:
+            pass
+
+    def _exchange(payload: dict) -> bool:
+        req = _ureq.Request(
+            f"{HA_BASE}/api/auth/token", method="POST",
+            data=_urlencode(payload).encode(),
+            headers={"Content-Type": "application/x-www-form-urlencoded"})
+        try:
+            _ha_open(req, 20).read()
+            return True
+        except Exception as e:
+            log.warning("HA 换取 refresh_token 失败: %s", e)
+            return False
+
+    if not ha_alive():
+        return
+
+    created = False
+    try:
+        data = json.loads(Path(HA_AUTH_FILE).read_text(encoding="utf-8"))["data"]
+        created = any(u.get("is_owner") for u in data["users"])
+    except Exception:
+        pass
+
+    if created:
+        # owner 已存在（上次 onboarding 只建了用户）：密码登录换 refresh_token
+        _exchange({"grant_type": "password", "client_id": f"{HA_BASE}/",
+                   "username": creds["username"], "password": creds["password"]})
+    else:
+        # 全新配置：onboarding 建用户，响应带 auth_code，直接换 token
+        try:
+            req = _ureq.Request(
+                f"{HA_BASE}/api/onboarding/users", method="POST",
+                data=json.dumps({"name": "管理员", "username": creds["username"],
+                                 "password": creds["password"],
+                                 "language": "zh-Hans",
+                                 "client_id": f"{HA_BASE}/"}).encode(),
+                headers={"Content-Type": "application/json"})
+            resp = json.loads(_ha_open(req, 20).read().decode())
+            log.info("HA 首次初始化：已自动创建 owner 账号（凭据在 config/.owner.json）")
+            code = resp.get("auth_code")
+            if code:
+                _exchange({"grant_type": "authorization_code", "code": code,
+                           "client_id": f"{HA_BASE}/"})
+            else:
+                _exchange({"grant_type": "password", "client_id": f"{HA_BASE}/",
+                           "username": creds["username"],
+                           "password": creds["password"]})
+        except Exception as e:
+            log.warning("HA onboarding 自动完成失败: %s", e)
+            return
+
+    for _ in range(15):                             # 等待 .storage/auth 落盘
+        if _owners_with_token():
+            return
+        time.sleep(1)
+    log.warning("HA 令牌已请求但 .storage/auth 未出现 owner refresh_token")
 
 
 def _ha_make_token() -> str:
