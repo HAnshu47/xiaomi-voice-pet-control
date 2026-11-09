@@ -185,7 +185,8 @@ def _ha_ensure_owner() -> None:
     req = _ureq.Request(
         f"{HA_BASE}/api/onboarding/users", method="POST",
         data=json.dumps({"name": "管理员", "username": "owner",
-                         "password": password, "language": "zh-Hans"}).encode(),
+                         "password": password, "language": "zh-Hans",
+                         "client_id": f"{HA_BASE}/"}).encode(),
         headers={"Content-Type": "application/json"})
     try:
         _ha_open(req, 20).read()
