@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""v3 客户端托盘程序。
+r"""v3 客户端托盘程序。
 
 双击 start_client.vbs（= runtime\pythonw.exe tray.pyw）后：
   - 系统托盘常驻一个图标
