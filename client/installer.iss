@@ -28,7 +28,7 @@ WizardStyle=modern
 UninstallFilesDir={app}\_uninstall
 
 [Files]
-; 整个便携目录原样进安装包（runtime + app + config + 客户端.vbs + 使用说明）
+; 整个便携目录原样进安装包（runtime + app + config + start_client.vbs + README）
 Source: "{#DistDir}\*"; DestDir: "{app}"; Flags: recursesubdirs ignoreversion
 
 [Icons]

@@ -7,7 +7,7 @@
 
 产出结构:
     build/XiaoAiPetControl/
-    ├─ 客户端.vbs            # 双击无窗启动托盘
+    ├─ start_client.vbs      # 双击无窗启动托盘
     ├─ app/                  # voice_bridge.py + tray.pyw
     ├─ runtime/              # python-3.12-embed + site-packages（HA/miservice/pystray）
     └─ config/homeassistant/ # HA 配置骨架（首启自动补全）
@@ -143,17 +143,21 @@ def stage_config() -> None:
 
 
 def stage_launcher() -> None:
-    vbs = BUILD / "客户端.vbs"
+    # 纯 ASCII 的 vbs：引号一律用 Chr(34) 拼，避开 VBScript 的 "" 转义陷阱
+    # （双引号紧邻会被解析成「关串再开串」，导致"未结束的字符串常量"）
+    vbs = BUILD / "start_client.vbs"
     vbs.write_text(
         'Set fso = CreateObject("Scripting.FileSystemObject")\n'
+        'Set sh = CreateObject("Wscript.Shell")\n'
         "here = fso.GetParentFolderName(WScript.ScriptFullName)\n"
-        'CreateObject("Wscript.Shell").Run _\n'
-        '  """" & here & "\\runtime\\pythonw.exe"" "" & here & "\\app\\tray.pyw""", 0, False\n',
-        encoding="gbk")     # 中文文件名的 vbs，记事本/双击都按 ANSI 读
-    readme = BUILD / "使用说明.txt"
+        "q = Chr(34)\n"
+        'sh.Run q & here & "\\runtime\\pythonw.exe" & q & " " & _\n'
+        "        q & here & \"\\app\\tray.pyw\" & q, 0, False\n",
+        encoding="ascii")
+    readme = BUILD / "README.txt"
     readme.write_text(
         "【小爱宠物语音控制 · 客户端】\n\n"
-        "1. 双击「客户端.vbs」启动（推荐发送到桌面快捷方式）\n"
+        "1. 双击 start_client.vbs 启动（推荐发送到桌面快捷方式）\n"
         "2. 托盘出现橙色猫爪图标，右键：打开管理面板 / 启动 HA / 日志 / 开机自启\n"
         "3. 第一次使用：托盘 → 打开管理面板 → 「账号」页登录小米账号\n"
         "4. 集成（小佩/德业等）在面板「集成中心」搜索安装\n\n"

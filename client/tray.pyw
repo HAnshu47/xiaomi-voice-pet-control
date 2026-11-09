@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """v3 客户端托盘程序。
 
-双击「客户端.exe」（= runtime\\pythonw.exe tray.pyw）后：
+双击 start_client.vbs（= runtime\pythonw.exe tray.pyw）后：
   - 系统托盘常驻一个图标
   - 自动拉起 voice_bridge（面板 + 轮询 + HA 看门狗都在里面）
   - 菜单：打开面板 / 启动 HA / 日志 / 开机自启 / 退出

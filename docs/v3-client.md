@@ -10,7 +10,7 @@
 ├─ runtime/              内嵌 Python 3.12.8 + 全部依赖（HA 2025.1.4 / miservice / pystray…）
 ├─ app/                  voice_bridge.py（桥 + 面板） + tray.pyw（托盘） + icon.ico
 ├─ config/homeassistant/ HA 配置（首启自动补全；用户的令牌、口令、集成都在这附近）
-└─ 客户端.vbs / 使用说明.txt
+└─ start_client.vbs / README.txt
 ```
 
 - **托盘（tray.pyw）**：橙色猫爪图标。菜单：打开面板 / 启动 HA / 查看日志 /
@@ -66,4 +66,4 @@ ISCC.exe client/installer.iss             # → build/Output/小爱宠物语音�
 - 内嵌 runtime：HA 2025.1.4 / miservice / pystray / PIL / six 全部导入成功
 - 便携目录启动 `voice_bridge.py --run`：面板正常监听，未登录时正确提示去面板登录
 - 托盘模块加载、图标构建、路径解析（桥接脚本 / 运行时定位）通过
-- 托盘 GUI 与安装器的实机验证：双击 `客户端.vbs` 实测（需在真机桌面环境）
+- 托盘 GUI 与安装器的实机验证：双击 `start_client.vbs` 实测（需在真机桌面环境）
