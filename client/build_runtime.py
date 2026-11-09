@@ -143,20 +143,59 @@ def stage_app() -> None:
 
 
 def stage_config() -> None:
-    """HA 配置骨架：最小 configuration.yaml，首启由 HA 自动补全其余。"""
+    """HA 配置骨架：精简显式配置（对齐开发机已验证的 Windows 方案）。"""
     (CONFIG / "custom_components").mkdir(parents=True, exist_ok=True)
-    yaml = CONFIG / "configuration.yaml"
-    if not yaml.is_file():
-        yaml.write_text(
-            "# v3 客户端默认配置（客户端会自动追加 logger 等）\n"
-            "default_config:\n"
-            "\n"
-            "logger:\n"
-            "  default: warning\n"
-            "  logs:\n"
-            "    homeassistant.config_entries: critical\n"
-            "    homeassistant: error\n",
-            encoding="utf-8")
+    (CONFIG / "themes").mkdir(parents=True, exist_ok=True)
+    # 不用 default_config：它会强制加载 bluetooth/dhcp/ssdp/usb/assist_pipeline，
+    # 这些在 Windows 受限环境必崩（缺 C 编译器/系统 DLL），导致 default_config
+    # 整体失败、auth 等关键组件也不被加载（/api/auth/token 直接 404）
+    (CONFIG / "configuration.yaml").write_text(
+        "# ===== Home Assistant (Windows 原生运行) 精简配置 =====\n"
+        "# 说明：不使用 default_config，因为它会强制加载 bluetooth / dhcp /\n"
+        "# ssdp / usb / assist_pipeline，这些集成在 Windows + 受限环境的机器上\n"
+        "# 会编译失败或崩溃（需要 C 编译器和系统 DLL）。显式列出实际需要的集成。\n"
+        "\n"
+        "frontend:\n"
+        "\n"
+        "config: {}\n"
+        "person: {}\n"
+        "homeassistant: {}\n"
+        "\n"
+        "automation: !include automations.yaml\n"
+        "script: !include scripts.yaml\n"
+        "scene: !include scenes.yaml\n"
+        "\n"
+        "# 读取小爱音箱等设备的原始属性（音量/播放状态不推送，只能主动拉）\n"
+        "miot_signal:\n"
+        "\n"
+        "input_boolean:\n"
+        "  miot_auto_reset:\n"
+        "    name: 设备自动复位中\n"
+        "    icon: mdi:sync\n"
+        "    initial: off\n"
+        "  mic_mute:\n"
+        "    name: 音箱静音（镜像）\n"
+        "    icon: mdi:microphone-off\n"
+        "    initial: off\n"
+        "\n"
+        "logger:\n"
+        "  default: warning\n"
+        "  logs:\n"
+        "    custom_components.xiaomi_home: debug\n"
+        "    custom_components.miot_signal: debug\n"
+        "    homeassistant.config_entries: critical\n"
+        "    homeassistant: error\n"
+        "system_log: {}\n",
+        encoding="utf-8")
+    for name in ("automations.yaml", "scripts.yaml", "scenes.yaml"):
+        f = CONFIG / name
+        if not f.is_file():
+            f.write_text("[]\n", encoding="utf-8")
+    # miot_signal 自定义组件随包分发（读音箱原始属性用）
+    src = REPO / "custom_components" / "miot_signal"
+    dst = CONFIG / "custom_components" / "miot_signal"
+    if src.is_dir() and not dst.is_dir():
+        shutil.copytree(src, dst)
     print("config 骨架已就绪")
 
 
