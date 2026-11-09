@@ -50,7 +50,7 @@ DEFAULT_COMMANDS = [
 ]
 
 HA_BASE = "http://127.0.0.1:8123"
-HA_AUTH_FILE = r"D:\xiaomi\homeassistant\.storage\auth"   # 自签 token 的凭据来源
+# 自签 token 的凭据来源在 HA_CONFIG_DIR 定义之后（见 _ha_auth_file）
 
 # Web 管理面板（口令管理/设备功能/测试/日志）。绑定本机回环，局域网不可见
 PANEL_HOST = "127.0.0.1"
@@ -153,9 +153,65 @@ _ha_token = {"value": "", "exp": 0.0}
 _ha_warn_at = 0.0        # 上次「HA 拉取失败」告警时间，用于降噪
 
 
+def _ha_ensure_owner() -> None:
+    """客户端全新配置时 HA 尚未 onboarding：自动创建 owner 用户。
+
+    开发机上是手动注册的；分发的客户端必须全自动。创建 owner 后
+    .storage/auth 才有 owner 的 refresh_token，_ha_make_token 才能自签。
+    """
+    try:
+        data = json.loads(Path(HA_AUTH_FILE).read_text(encoding="utf-8"))["data"]
+        owners = {u["id"] for u in data["users"] if u.get("is_owner")}
+        tokens = data["refresh_tokens"]
+        if isinstance(tokens, dict):
+            tokens = list(tokens.values())
+        if any(t.get("user_id") in owners for t in tokens):
+            return                                  # 已有 owner，无事可做
+    except Exception:
+        pass                                        # auth 文件还没生成也照走 onboarding
+    if not ha_alive():
+        return
+    from urllib import request as _ureq
+    import secrets as _secrets
+    password = _secrets.token_urlsafe(12)
+    try:
+        (HA_CONFIG_DIR / ".owner.json").write_text(
+            json.dumps({"username": "owner", "password": password,
+                        "说明": "浏览器登录 HA 用的凭据（面板 OAuth 授权也会用到）"},
+                       ensure_ascii=False, indent=2),
+            encoding="utf-8")
+    except Exception:
+        pass
+    req = _ureq.Request(
+        f"{HA_BASE}/api/onboarding/users", method="POST",
+        data=json.dumps({"name": "管理员", "username": "owner",
+                         "password": password, "language": "zh-Hans"}).encode(),
+        headers={"Content-Type": "application/json"})
+    try:
+        _ha_open(req, 20).read()
+        log.info("HA 首次初始化：已自动创建 owner 账号（凭据在 config/.owner.json）")
+    except Exception as e:
+        log.warning("HA onboarding 自动完成失败: %s", e)
+        return
+    for _ in range(20):                             # 等待 .storage/auth 落盘
+        time.sleep(1)
+        try:
+            data = json.loads(Path(HA_AUTH_FILE).read_text(encoding="utf-8"))["data"]
+            owners = {u["id"] for u in data["users"] if u.get("is_owner")}
+            tokens = data["refresh_tokens"]
+            if isinstance(tokens, dict):
+                tokens = list(tokens.values())
+            if any(t.get("user_id") in owners for t in tokens):
+                return
+        except Exception:
+            continue
+    log.warning("HA onboarding 已提交但 .storage/auth 未出现 owner 凭据")
+
+
 def _ha_make_token() -> str:
     import jwt  # pyjwt，装在 venv-voice 里
 
+    _ha_ensure_owner()
     data = json.loads(Path(HA_AUTH_FILE).read_text(encoding="utf-8"))["data"]
     tokens = data["refresh_tokens"]
     if isinstance(tokens, dict):
@@ -799,6 +855,7 @@ async def _panel_submit_otp(code: str) -> dict:
 # v3 客户端布局：HA 配置在 ../config/homeassistant；开发布局在同级 homeassistant/
 _CLIENT_CFG = BASE_DIR.parent / "config" / "homeassistant"
 HA_CONFIG_DIR = _CLIENT_CFG if _CLIENT_CFG.is_dir() else BASE_DIR / "homeassistant"
+HA_AUTH_FILE = HA_CONFIG_DIR / ".storage" / "auth"   # 自签 token 的凭据来源
 
 IC_CATALOG = [
     {"domain": "petkit", "name": "小佩 PetKit",

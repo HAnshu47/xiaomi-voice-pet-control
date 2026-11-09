@@ -107,9 +107,27 @@ def stage_runtime() -> None:
          "--no-warn-script-location", "--only-binary=:all:"],
         check=True,
     )
-    # pip 自身 60MB+ 用不到，删掉减包体
-    subprocess.run([str(py), "-m", "pip", "uninstall", "-y", "pip", "setuptools",
-                    "wheel"], check=False)
+    # 补充清单：环境标记被跳过但 Windows 上实际需要的包 + 二级依赖
+    extra = REPO / "client" / "ha_pins_extra.txt"
+    if extra.is_file():
+        subprocess.run(
+            [str(py), "-m", "pip", "install", "-r", str(extra),
+             "--no-warn-script-location", "--only-binary=:all:"],
+            check=True,
+        )
+    # HA Windows 兼容补丁：os.fchmod / AsyncResolver / add_signal_handler
+    # （HA 2025.1 起官方不再支持 Windows，补丁取自实测可用的开发环境）
+    patch_root = REPO / "client" / "ha_patches"
+    if patch_root.is_dir():
+        sp = RUNTIME / "Lib" / "site-packages" / "homeassistant"
+        n = 0
+        for f in patch_root.rglob("*.py"):
+            rel = f.relative_to(patch_root)
+            shutil.copy2(f, sp / rel)
+            n += 1
+        print(f"已应用 {n} 个 HA Windows 兼容补丁")
+    # 注意：不能卸 pip——HA 安装品牌集成的自定义组件时会自己调
+    # python -m pip 把组件依赖装进 config/deps，pip 必须保留
     done_marker.touch()
     print("runtime 组装完成")
 
