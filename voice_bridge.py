@@ -1793,7 +1793,12 @@ async function loadEntities(force) {
     } catch (e) { /* 保持原值，下面按空处理 */ }
   }
   if (!PANEL_ENTITIES.length) {
-    selB.innerHTML = '<option value="">HA 实体加载失败（HA 未运行？）</option>';
+    // 区分两种「空」：接口失败（HA 没运行）vs 成功但没有可控制设备（没装品牌集成）
+    let alive = false;
+    try { alive = (await jget('/api/status')).ha_alive; } catch (e) {}
+    selB.innerHTML = alive
+      ? '<option value="">HA 运行中，但还没有可控制的设备 —— 请先去「集成中心」安装品牌集成（如小米米家）并完成配置</option>'
+      : '<option value="">HA 实体加载失败（HA 未运行？请去「集成中心」启动）</option>';
     return;
   }
   const nonScript = PANEL_ENTITIES.filter(e => e.brand !== '脚本');
