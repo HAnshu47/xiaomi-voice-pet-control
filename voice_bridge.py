@@ -2045,6 +2045,7 @@ async function doLogout() {
 
 /* ---------- 集成中心 ---------- */
 let IC_FLOW = null;
+let IC_DOMAIN = '';          // 当前配置向导的集成域名（流程失效自动重开时用）
 let IC_POLL_T = null;
 let HA_BOOT_T = null;
 
@@ -2224,6 +2225,7 @@ document.addEventListener('keydown', e => {
 async function icFlow(domain) {
   if (IC_BUSY) return;                 // 连点无效，避免重复创建 HA flow
   IC_BUSY = true;
+  IC_DOMAIN = domain;
   icModalOpen();
   $('ic-login-title').textContent = '配置 / 登录：' + domain;
   $('ic-form').innerHTML = '<p class="hint">正在打开配置向导…</p>';
@@ -2309,7 +2311,25 @@ function icRenderForm(step) {
 
 async function icSubmit() {
   if (IC_BUSY) return;
-  if (!IC_FLOW || !IC_FLOW.flow_id) return showMsg('msg-ic-flow', '没有进行中的配置', false);
+  // 流程丢失（HA 重启过 / 页面刷新过）：自动重新拉起向导，而不是报错让用户干瞪眼
+  if (!IC_FLOW || !IC_FLOW.flow_id) {
+    const h = (IC_FLOW && IC_FLOW.handler) || IC_DOMAIN || '';
+    if (!h) return showMsg('msg-ic-flow', '没有进行中的配置，请从集成中心重新点「配置 / 登录」', false);
+    showMsg('msg-ic-flow', '配置会话已失效，正在重新打开向导…', true, true);
+    try {
+      const r = await jpost('/api/ic/flow', {handler: h});
+      IC_FLOW = r;
+      if (r.type === 'form') {
+        icRenderForm(r);
+        showMsg('msg-ic-flow', '原会话已失效（HA 重启过），已重新打开向导，请重新填写并提交', true);
+      } else {
+        showMsg('msg-ic-flow', '向导已重开：' + (r.reason || r.error || '请在集成中心查看'), false);
+      }
+    } catch (e) {
+      showMsg('msg-ic-flow', '重新打开向导失败：' + e, false);
+    }
+    return;
+  }
   const fields = {};
   $('ic-form').querySelectorAll('[id^="f_"]').forEach(el => {
     const k = el.id.slice(2);
