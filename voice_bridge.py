@@ -1452,8 +1452,10 @@ def ic_missing_requirements(domain: str) -> list[str]:
             "    return any(importlib.util.find_spec(m) is not None for m in spec.split('|'))\n"
             "print(json.dumps([s for s in sys.argv[1:] if not ok(s)]))\n")
     try:
+        nt_flags = 0x08000000 if os.name == "nt" else 0  # CREATE_NO_WINDOW：不闪黑窗
         p = subprocess.run([_ha_python(), "-c", code, *mods],
-                           capture_output=True, text=True, timeout=25)
+                           capture_output=True, text=True, timeout=25,
+                           creationflags=nt_flags)
         missing = json.loads((p.stdout or "[]").strip() or "[]")
         return [mapping.get(m, m) for m in missing]
     except Exception:  # noqa: BLE001

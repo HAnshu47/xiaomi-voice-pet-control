@@ -79,8 +79,9 @@ def stage_runtime() -> None:
     subprocess.run([str(py), str(get_pip), "--no-warn-script-location"],
                    check=True)
 
-    # fnvhash 0.1.0（HA 依赖链要求 <0.2）只有 sdist，先单独放行装好
+    # fnvhash 0.1.0 / petkitaio 0.1.12 只有 sdist，先单独放行装好
     subprocess.run([str(py), "-m", "pip", "install", "fnvhash==0.1.0",
+                    "petkitaio==0.1.12",
                     "--no-warn-script-location"], check=True)
     # HA 的依赖树太大，直接解析会 resolution-too-deep。改为确定性安装：
     # ha_pins.txt 是从 HA 2025.1.4 METADATA 提取的官方钉死清单（按 win/cp312
