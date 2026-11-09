@@ -2305,6 +2305,15 @@ function icRenderForm(step) {
     const isSecret = /pass|pwd|token|secret|key/i.test(key);
     return `<label>${label}</label><input type="${isSecret ? 'password' : 'text'}" id="f_${key}" value="${val}">`;
   }).join('') || '<p class="hint">本步骤无需填写，直接提交</p>';
+  // 渲染 HA 的描述占位内容：图片验证码（base64）与风控验证链接
+  const tip = String(ph.tip || '');
+  const capMatch = tip.match(/!\[[^\]]*\]\((data:image\/[^)]+)\)/);
+  let extra = '';
+  if (capMatch) extra += `<div style="margin:8px 0"><img src="${capMatch[1]}" alt="验证码" style="max-width:100%;border:1px solid #ccc;border-radius:6px">` +
+    `<p class="hint" style="margin:4px 0 0">请输入上图中的字符到 captcha 字段</p></div>`;
+  else if (tip) extra += `<p class="hint" style="margin:8px 0">${tip.replace(/!\[[^\]]*\]\([^)]*\)/g, '').trim()}</p>`;
+  if (ph.url) extra += `<p style="margin:8px 0"><a href="${ph.url}" target="_blank">点此打开验证网页（完成后把页面上的票据填入 verify_ticket 字段）</a></p>`;
+  if (extra) $('ic-form').innerHTML = extra + $('ic-form').innerHTML;
   $('msg-ic-flow').className = 'msg';
   $('msg-ic-flow').dataset.text = '';
 }
@@ -2350,7 +2359,9 @@ async function icSubmit() {
     const ERR_ZH = {invalid_auth: '账号或密码不对', cannot_connect: '连不上服务器',
                     invalid_host: '服务器地址不对', timeout_connect: '连接超时',
                     unknown: '未知错误，稍后再试', already_configured: '这个账号已经配置过了',
-                    invalid_input: '填写内容不合法'};
+                    invalid_input: '填写内容不合法',
+                    cannot_login: '登录失败：账号或密码不对；若上方出现验证码图片请先填写 captcha',
+                    cannot_reach: '连不上品牌服务器，检查网络后重试'};
     const errText = (errs => {
       if (!errs || !Object.keys(errs).length) return '';
       return Object.entries(errs)
