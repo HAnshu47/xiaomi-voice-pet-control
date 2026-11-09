@@ -796,7 +796,9 @@ async def _panel_submit_otp(code: str) -> dict:
 # ---------------------------------------------------------------------------
 # 集成中心：面板内安装品牌集成（驱动）+ 代理 HA 配置/登录流程
 # ---------------------------------------------------------------------------
-HA_CONFIG_DIR = BASE_DIR / "homeassistant"
+# v3 客户端布局：HA 配置在 ../config/homeassistant；开发布局在同级 homeassistant/
+_CLIENT_CFG = BASE_DIR.parent / "config" / "homeassistant"
+HA_CONFIG_DIR = _CLIENT_CFG if _CLIENT_CFG.is_dir() else BASE_DIR / "homeassistant"
 
 IC_CATALOG = [
     {"domain": "petkit", "name": "小佩 PetKit",
