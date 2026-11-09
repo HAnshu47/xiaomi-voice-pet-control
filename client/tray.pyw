@@ -188,10 +188,15 @@ def _watch_bridge() -> None:
     import threading
 
     def loop():
-        while _icon.visible:
-            if not _bridge_alive():
-                _start_bridge()
-                time.sleep(20)          # 给冷启动留时间，避免反复拉
+        # 不能用 while _icon.visible：线程先于 icon.run() 启动，visible
+        # 那时是 False，循环体一次都不会执行（看门狗等于没装）
+        while True:
+            try:
+                if _icon.visible and not _bridge_alive():
+                    _start_bridge()
+                    time.sleep(20)      # 给冷启动留时间，避免反复拉
+            except Exception:
+                pass
             time.sleep(10)
 
     threading.Thread(target=loop, daemon=True).start()
