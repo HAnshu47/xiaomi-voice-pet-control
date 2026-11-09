@@ -199,7 +199,7 @@ def _ha_ensure_owner() -> None:
 
     def _exchange(payload: dict) -> bool:
         req = _ureq.Request(
-            f"{HA_BASE}/api/auth/token", method="POST",
+            f"{HA_BASE}/auth/token", method="POST",
             data=_urlencode(payload).encode(),
             headers={"Content-Type": "application/x-www-form-urlencoded"})
         try:
@@ -207,6 +207,32 @@ def _ha_ensure_owner() -> None:
             return True
         except Exception as e:
             log.warning("HA 换取 refresh_token 失败: %s", e)
+            return False
+
+    def _login_flow_token(username: str, password: str) -> bool:
+        """HA 2023.7+ 已移除 password grant，只能走 login_flow 拿 code 再换令牌。"""
+        body = {"handler": ["homeassistant", None], "redirect_uri": f"{HA_BASE}/",
+                "client_id": f"{HA_BASE}/"}
+        try:
+            req = _ureq.Request(
+                f"{HA_BASE}/auth/login_flow", method="POST",
+                data=json.dumps(body).encode(),
+                headers={"Content-Type": "application/json"})
+            flow = json.loads(_ha_open(req, 20).read().decode())
+            req2 = _ureq.Request(
+                f"{HA_BASE}/auth/login_flow/{flow['flow_id']}", method="POST",
+                data=json.dumps({"username": username, "password": password,
+                                 "client_id": f"{HA_BASE}/"}).encode(),
+                headers={"Content-Type": "application/json"})
+            res = json.loads(_ha_open(req2, 20).read().decode())
+            code = res.get("result")
+            if res.get("type") == "create_entry" and code:
+                return _exchange({"grant_type": "authorization_code",
+                                  "code": code, "client_id": f"{HA_BASE}/"})
+            log.warning("HA 登录流程未完成: %s", res.get("type") or res)
+            return False
+        except Exception as e:
+            log.warning("HA login_flow 失败: %s", e)
             return False
 
     if not ha_alive():
@@ -220,9 +246,8 @@ def _ha_ensure_owner() -> None:
         pass
 
     if created:
-        # owner 已存在（上次 onboarding 只建了用户）：密码登录换 refresh_token
-        _exchange({"grant_type": "password", "client_id": f"{HA_BASE}/",
-                   "username": creds["username"], "password": creds["password"]})
+        # owner 已存在（上次 onboarding 只建了用户）：登录流程换 refresh_token
+        _login_flow_token(creds["username"], creds["password"])
     else:
         # 全新配置：onboarding 建用户，响应带 auth_code，直接换 token
         try:
@@ -240,9 +265,7 @@ def _ha_ensure_owner() -> None:
                 _exchange({"grant_type": "authorization_code", "code": code,
                            "client_id": f"{HA_BASE}/"})
             else:
-                _exchange({"grant_type": "password", "client_id": f"{HA_BASE}/",
-                           "username": creds["username"],
-                           "password": creds["password"]})
+                _login_flow_token(creds["username"], creds["password"])
         except Exception as e:
             log.warning("HA onboarding 自动完成失败: %s", e)
             return
