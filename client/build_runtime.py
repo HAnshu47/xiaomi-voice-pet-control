@@ -116,11 +116,12 @@ def stage_runtime() -> None:
              "--no-warn-script-location", "--only-binary=:all:"],
             check=True,
         )
-    # HA Windows 兼容补丁：os.fchmod / AsyncResolver / add_signal_handler
+    # HA Windows 兼容补丁：os.fchmod / ThreadedResolver / add_signal_handler /
+    # sitecustomize（add_reader/add_writer 轮询降级，xiaomi_home MQTT 必需）
     # （HA 2025.1 起官方不再支持 Windows，补丁取自实测可用的开发环境）
     patch_root = REPO / "client" / "ha_patches"
     if patch_root.is_dir():
-        sp = RUNTIME / "Lib" / "site-packages" / "homeassistant"
+        sp = RUNTIME / "Lib" / "site-packages"
         n = 0
         for f in patch_root.rglob("*.py"):
             rel = f.relative_to(patch_root)
