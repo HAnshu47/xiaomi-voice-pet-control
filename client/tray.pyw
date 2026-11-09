@@ -36,8 +36,25 @@ RUN_VALUE = "XiaoAiPetControl"
 _mutex = ctypes.windll.kernel32.CreateMutexW(None, False, MUTEX_NAME)
 if ctypes.windll.kernel32.GetLastError() == 183:    # ERROR_ALREADY_EXISTS
     # 已在运行：直接把面板带到前台
-    webbrowser.open(PANEL_URL)
+    _open_panel()
     sys.exit(0)
+
+
+def _open_panel() -> None:
+    """用 Edge 应用模式开面板：独立窗口、无地址栏，看起来是桌面应用而非网页。"""
+    edge = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) \
+        / "Microsoft" / "Edge" / "Application" / "msedge.exe"
+    if not edge.is_file():
+        edge = Path(r"C:\Program Files") / "Microsoft" / "Edge" / "Application" / "msedge.exe"
+    if edge.is_file():
+        flags = 0x00000008 | 0x00000200          # DETACHED | NEW_PROCESS_GROUP
+        subprocess.Popen([str(edge), f"--app={PANEL_URL}",
+                          f"--user-data-dir={APP_DIR / '.edge-profile'}"],
+                         creationflags=flags,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, close_fds=True)
+    else:
+        webbrowser.open(PANEL_URL)
 
 
 def _bridge_alive() -> bool:
@@ -54,12 +71,15 @@ def _start_bridge() -> str:
     if not PYTHONW.is_file():
         return f"找不到运行时: {PYTHONW}"
     flags = 0x00000008 | 0x00000200 | 0x01000000  # DETACHED | NEW_GROUP | BREAKAWAY
-    subprocess.Popen(
-        [str(PYTHONW), str(BRIDGE_SCRIPT)],
-        cwd=str(APP_DIR), creationflags=flags,
-        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL, close_fds=True,
-    )
+    try:
+        subprocess.Popen(
+            [str(PYTHONW), str(BRIDGE_SCRIPT), "--run"],   # 必须带 --run 才常驻
+            cwd=str(APP_DIR), creationflags=flags,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, close_fds=True,
+        )
+    except OSError as e:
+        return f"启动失败: {e}"     # 托盘不能因拉起失败而崩
     return "已启动"
 
 
@@ -88,7 +108,7 @@ def _autostart_enabled() -> bool:
 
 def _autostart_toggle() -> str:
     import winreg
-    target = f'"{PYTHONW}" "{BRIDGE_SCRIPT}"'
+    target = f'"{PYTHONW}" "{BRIDGE_SCRIPT}" --run'
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
                             winreg.KEY_SET_VALUE) as k:
@@ -115,7 +135,7 @@ def _make_icon():
         d.ellipse([x - r, y - r, x + r, y + r], fill=(255, 255, 255, 255))
 
     def on_open(icon, item):
-        webbrowser.open(PANEL_URL)
+        _open_panel()
 
     def on_ha(icon, item):
         notify(_post("/api/ha/start", {}))
