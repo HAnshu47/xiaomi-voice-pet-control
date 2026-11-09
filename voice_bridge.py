@@ -54,7 +54,7 @@ HA_AUTH_FILE = r"D:\xiaomi\homeassistant\.storage\auth"   # 自签 token 的凭�
 
 # Web 管理面板（口令管理/设备功能/测试/日志）。绑定本机回环，局域网不可见
 PANEL_HOST = "127.0.0.1"
-PANEL_PORT = 8124
+PANEL_PORT = int(os.environ.get("VB_PANEL_PORT", "8124"))   # 端口冲突时可用环境变量改
 
 POLL_INTERVAL = 1.5     # 轮询间隔（秒）。低于 1 秒有风控风险
 COOLDOWN = 6.0          # 同一脚本两次触发的最小间隔（秒），防连喊重复执行
@@ -867,6 +867,23 @@ _HA_EXE_CANDIDATES = (
 )
 
 
+def _ha_launch_cmd() -> "list[str] | None":
+    """HA 启动命令。
+
+    v3 客户端布局（app/ 旁有 runtime/ 内嵌 Python）优先用内嵌环境跑
+    `python -m homeassistant`，与客户端分发一致；否则退回开发机的 hass.exe。
+    """
+    rt = BASE_DIR.parent / "runtime" / "python.exe"
+    if rt.is_file():
+        return [str(rt), "-m", "homeassistant"]
+    for p in _HA_EXE_CANDIDATES:
+        if Path(p).is_file():
+            return [p]
+    import shutil
+    w = shutil.which("hass")
+    return [w] if w else None
+
+
 _HA_STATE = {
     "start_ts": 0.0,      # 最近一次由面板拉起 HA 的时间
     "spawn_ts": 0.0,      # 上一次真正执行 Popen 的时间（防抖，避免拉起两个 HA）
@@ -925,16 +942,9 @@ def ha_start(force: bool = False) -> dict:
             return {"ok": True, "msg": "HA 正在启动中…"}
         _HA_STATE["spawn_ts"] = now
 
-    exe = None
-    for p in _HA_EXE_CANDIDATES:
-        if Path(p).is_file():
-            exe = p
-            break
-    if exe is None:
-        import shutil
-        exe = shutil.which("hass")
-    if exe is None:
-        return {"ok": False, "error": "找不到 hass.exe，请确认 Python 环境或手动双击 start_ha.bat"}
+    cmd = _ha_launch_cmd()
+    if cmd is None:
+        return {"ok": False, "error": "找不到可用的 HA 运行环境（内嵌 runtime 或 hass.exe）"}
 
     # 脱离控制台 + 脱离父进程的 Job：否则关掉面板窗口（或 Windows 收割 Job）时
     # HA 会作为子进程被连带杀掉——实测出现过「重启面板后 HA 无痕消失」
@@ -945,7 +955,7 @@ def ha_start(force: bool = False) -> dict:
 
     def _spawn(f: int) -> None:
         subprocess.Popen(
-            [exe, "--config", str(HA_CONFIG_DIR), "--ignore-os-check"],
+            [*cmd, "--config", str(HA_CONFIG_DIR), "--ignore-os-check"],
             cwd=str(HA_CONFIG_DIR), creationflags=f,
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, close_fds=True,
@@ -1272,6 +1282,9 @@ def _ic_manifest(domain: str) -> dict:
 
 def _ha_python() -> str:
     """HA 用的那个 python.exe（面板自己跑在 venv 里，依赖装的位置不一样）。"""
+    rt = BASE_DIR.parent / "runtime" / "python.exe"
+    if rt.is_file():
+        return str(rt)          # v3 客户端布局：HA 跑在内嵌 runtime 里
     for p in _HA_EXE_CANDIDATES:
         if Path(p).is_file():
             cand = Path(p).parent.parent / "python.exe"
