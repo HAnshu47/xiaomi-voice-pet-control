@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any
 import aiohttp
 from aiohttp import web
 from aiohttp.hdrs import CONTENT_TYPE, USER_AGENT
-from aiohttp.resolver import AsyncResolver
+from aiohttp.resolver import AsyncResolver, ThreadedResolver
 from aiohttp.web_exceptions import HTTPBadGateway, HTTPGatewayTimeout
 
 from homeassistant import config_entries
@@ -337,9 +337,10 @@ def _async_get_connector(
         ssl=ssl_context,
         limit=MAXIMUM_CONNECTIONS,
         limit_per_host=MAXIMUM_CONNECTIONS_PER_HOST,
-        # Windows: aiodns requires a SelectorEventLoop, which HA does not use
-        # on Windows (Proactor). Fall back to the default threaded resolver.
-        resolver=None if sys.platform == "win32" else AsyncResolver(),
+        # Windows: HA 跑在 ProactorEventLoop 上，aiodns 的 AsyncResolver 必崩
+        # （需要 SelectorEventLoop/winloop）。传 None 也不行——aiohttp 发现装了
+        # aiodns 会把 DefaultResolver 选成 AsyncResolver。必须显式用线程版解析器
+        resolver=ThreadedResolver() if sys.platform == "win32" else AsyncResolver(),
     )
     connectors[connector_key] = connector
 
