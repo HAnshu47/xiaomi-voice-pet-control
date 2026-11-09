@@ -24,3 +24,12 @@ aiodhcpwatcher==1.2.7
 scapy==2.8.0
 aiodiscover==3.2.3
 winloop==0.1.8
+# xiaomi_miot 集成依赖（netifaces 为可选且 .pyd 被系统策略拦，不装；
+# miio 对它有优雅降级）
+construct==2.10.70
+python-miio==0.5.12
+micloud==0.6
+pycryptodome==4.3.0
+click==8.5.1
+appdirs==1.4.4
+croniter==7.0.0
